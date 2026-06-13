@@ -27,21 +27,25 @@ uint32_t numHashes = 0;
 uint32_t blockedCnt = 0, allowedCnt = 0;
 uint8_t buf[600];    // DNS packets are small (UDP, <512 typical)
 
-// FNV-1a 64-bit — MUST match tools/build_blocklist.py byte-for-byte.
+// 5-byte (40-bit) truncated FNV-1a — MUST match tools/build_blocklist.py.
+static const int HASH_BYTES = 5;
+static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 static uint64_t fnv1a64(const char* s, size_t n) {
   uint64_t h = 0xcbf29ce484222325ULL;
   for (size_t i = 0; i < n; i++) { h ^= (uint8_t)s[i]; h *= 0x100000001b3ULL; }
-  return h;
+  return h & HASH_MASK;               // truncate to HASH_BYTES
 }
 
-// Binary-search the flash hash array for h. ~16 cached reads, no RAM copy.
+// Binary-search the flash hash array for h. ~20 cached reads, no RAM copy.
 static bool hashInBlocklist(uint64_t h) {
   int32_t lo = 0, hi = (int32_t)numHashes - 1;
-  uint64_t v;
+  uint8_t b[HASH_BYTES];
   while (lo <= hi) {
     int32_t mid = (lo + hi) >> 1;
-    blocklist.seek((uint32_t)mid * 8);
-    blocklist.read((uint8_t*)&v, 8);   // little-endian on both host & C3
+    blocklist.seek((uint32_t)mid * HASH_BYTES);
+    blocklist.read(b, HASH_BYTES);
+    uint64_t v = 0;
+    for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);   // little-endian
     if (v < h) lo = mid + 1;
     else if (v > h) hi = mid - 1;
     else return true;
@@ -122,7 +126,7 @@ void setup() {
   if (!LittleFS.begin(true)) { Serial.println("LittleFS mount FAILED"); }
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (!blocklist) Serial.println("!! blocklist.bin missing — run `pio run -t uploadfs`");
-  else { numHashes = blocklist.size() / 8; Serial.printf("blocklist: %u domains (%u bytes)\n", numHashes, (uint32_t)blocklist.size()); }
+  else { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains (%u bytes)\n", numHashes, (uint32_t)blocklist.size()); }
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
