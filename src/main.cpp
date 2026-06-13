@@ -11,6 +11,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <LittleFS.h>
+#include <ESPmDNS.h>
 
 // ---- config ----
 static const char* WIFI_SSID = "YOUR_WIFI_SSID";
@@ -129,10 +130,13 @@ void setup() {
   else { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains (%u bytes)\n", numHashes, (uint32_t)blocklist.size()); }
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);   // disable modem power-save -> much lower DNS latency
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("WiFi: joining %s", WIFI_SSID);
   while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
   Serial.printf("\nWiFi up: %s  -> point a client's DNS here to block ads\n", WiFi.localIP().toString().c_str());
+
+  if (MDNS.begin("c3adblock")) Serial.println("mDNS: reachable at c3adblock.local");
 
   dnsServer.begin(DNS_PORT);
   upstreamCli.begin(0);   // ephemeral local port
