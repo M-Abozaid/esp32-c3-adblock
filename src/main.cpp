@@ -15,7 +15,7 @@
 // ---- config ----
 static const char* WIFI_SSID = "YOUR_WIFI_SSID";
 static const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
-static const IPAddress UPSTREAM(1, 1, 1, 1);   // Cloudflare; resolves non-blocked queries
+static const IPAddress UPSTREAM(9, 9, 9, 9);   // Quad9 (Swiss non-profit; privacy + malware filtering)
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 
