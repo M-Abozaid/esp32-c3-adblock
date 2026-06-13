@@ -1,0 +1,9 @@
+# PlatformIO build output
+.pio/
+.vscode/
+
+# Generated blocklist (build it with tools/build_blocklist.py)
+data/blocklist.bin
+
+# Backups / scratch
+*.bak
