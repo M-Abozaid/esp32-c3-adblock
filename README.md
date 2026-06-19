@@ -42,7 +42,9 @@ python3 tools/build_blocklist.py --download data/blocklist.bin
 #    curl -sL https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts -o hosts
 #    python3 tools/build_blocklist.py hosts data/blocklist.bin
 
-# 2. set your WiFi creds in src/main.cpp (WIFI_SSID / WIFI_PASS)
+# 2. set your WiFi creds (secrets.h is gitignored, so they stay local)
+cp src/secrets.example.h src/secrets.h
+#    then edit src/secrets.h -> WIFI_SSID / WIFI_PASS
 
 # 3. flash firmware + the blocklist filesystem
 pio run -t upload
