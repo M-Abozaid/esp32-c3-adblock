@@ -11,10 +11,9 @@
 #include <WebServer.h>
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "secrets.h"   // defines WIFI_SSID / WIFI_PASS — copy secrets.example.h and fill in
 
 // ---- config ----
-static const char* WIFI_SSID = "YOUR_WIFI_SSID";
-static const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 static const IPAddress UPSTREAM(9, 9, 9, 9);     // Quad9
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
