@@ -24,6 +24,12 @@ static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 
+// ---- bloom filter (2 KB, ~0.1% false-positive rate at 140k domains) ----
+static const uint32_t BLOOM_BITS = 16384;   // 2 KB
+static const uint32_t BLOOM_MASK = BLOOM_BITS - 1;
+static uint8_t bloom[BLOOM_BITS / 8];
+static bool bloomReady = false;
+
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
@@ -53,6 +59,31 @@ static uint64_t fnv40(const char* s, size_t n) {
   for (size_t i = 0; i < n; i++) { h ^= (uint8_t)s[i]; h *= 0x100000001b3ULL; }
   return h & HASH_MASK;
 }
+// Two independent bit positions derived from the 40-bit hash (upper/lower 20 bits)
+static inline void bloomSet(uint64_t h) {
+  uint32_t a = (uint32_t)(h & BLOOM_MASK);
+  uint32_t b = (uint32_t)((h >> 20) & BLOOM_MASK);
+  bloom[a >> 3] |= 1 << (a & 7);
+  bloom[b >> 3] |= 1 << (b & 7);
+}
+static inline bool bloomCheck(uint64_t h) {
+  uint32_t a = (uint32_t)(h & BLOOM_MASK);
+  uint32_t b = (uint32_t)((h >> 20) & BLOOM_MASK);
+  return (bloom[a >> 3] >> (a & 7) & 1) && (bloom[b >> 3] >> (b & 7) & 1);
+}
+static void bloomBuild() {
+  memset(bloom, 0, sizeof(bloom));
+  bloomReady = false;
+  if (!blocklist || numHashes == 0) return;
+  uint8_t b[HASH_BYTES]; blocklist.seek(0);
+  for (uint32_t i = 0; i < numHashes; i++) {
+    if (blocklist.read(b, HASH_BYTES) != HASH_BYTES) break;
+    uint64_t v = 0; for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
+    bloomSet(v);
+  }
+  bloomReady = true;
+  Serial.printf("[bloom] built for %u domains\n", numHashes);
+}
 static bool inFlash(uint64_t h) {
   int32_t lo = 0, hi = (int32_t)numHashes - 1; uint8_t b[HASH_BYTES];
   while (lo <= hi) {
@@ -68,7 +99,8 @@ static bool isBlocked(const char* domain) {
   const char* p = domain;
   while (p && *p) {
     uint64_t h = fnv40(p, strlen(p));
-    if (inFlash(h) || inCustom(h)) return true;
+    if (inCustom(h)) return true;
+    if (!bloomReady || bloomCheck(h)) if (inFlash(h)) return true;
     const char* dot = strchr(p, '.'); if (!dot) break;
     const char* next = dot + 1; if (!strchr(next, '.')) break; p = next;
   }
@@ -259,6 +291,7 @@ static void handleBan() {
 static void reopenBlocklist() {
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+  bloomBuild();
 }
 static void beginBlocklistSwap() {
   if (blocklist) blocklist.close();
@@ -372,7 +405,7 @@ void setup() {
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); }
+  if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); bloomBuild(); }
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
