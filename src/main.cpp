@@ -26,6 +26,9 @@ static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
+static const int INDEX_ENTRIES = 4096;   // 20 KB first-level flash index
+static const int CACHE_SIZE = 256;       // must be power of 2
+static const int MAX_RANGE = 256;        // max hashes per index bucket
 
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
@@ -33,6 +36,13 @@ WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
 uint8_t buf[600];
+
+// first-level flash index (sorted sample hashes) + small direct-mapped cache
+static uint8_t blIndex[INDEX_ENTRIES][HASH_BYTES];
+static uint8_t cacheKey[CACHE_SIZE][HASH_BYTES];
+static uint8_t cacheRes[CACHE_SIZE];
+static uint8_t cacheValid[CACHE_SIZE];
+static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
 struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
 static const int MAX_CLIENTS = 96;
@@ -61,22 +71,84 @@ static uint64_t fnv40(const char* s, size_t n) {
   for (size_t i = 0; i < n; i++) { h ^= (uint8_t)s[i]; h *= 0x100000001b3ULL; }
   return h & HASH_MASK;
 }
+static inline uint64_t unpackHash(const uint8_t* b) {
+  uint64_t v = 0;
+  for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
+  return v;
+}
+static inline void packHash(uint64_t h, uint8_t* b) {
+  for (int k = 0; k < HASH_BYTES; k++) { b[k] = (uint8_t)h; h >>= 8; }
+}
+
+static void buildFlashIndex() {
+  if (!blocklist || numHashes == 0) return;
+  for (int i = 0; i < INDEX_ENTRIES; i++) {
+    uint32_t pos = (uint32_t)((uint64_t)i * (numHashes - 1) / (INDEX_ENTRIES - 1));
+    blocklist.seek((uint32_t)pos * HASH_BYTES);
+    blocklist.read(blIndex[i], HASH_BYTES);
+  }
+  for (int i = 0; i < CACHE_SIZE; i++) cacheValid[i] = 0;
+}
+
 static bool inFlash(uint64_t h) {
-  int32_t lo = 0, hi = (int32_t)numHashes - 1; uint8_t b[HASH_BYTES];
+  if (numHashes == 0) return false;
+  uint64_t first = unpackHash(blIndex[0]);
+  uint64_t last  = unpackHash(blIndex[INDEX_ENTRIES - 1]);
+  if (h < first || h > last) return false;
+
+  int lo = 0, hi = INDEX_ENTRIES - 2, seg = 0;
   while (lo <= hi) {
-    int32_t mid = (lo + hi) >> 1;
-    blocklist.seek((uint32_t)mid * HASH_BYTES); blocklist.read(b, HASH_BYTES);
-    uint64_t v = 0; for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
-    if (v < h) lo = mid + 1; else if (v > h) hi = mid - 1; else return true;
+    int mid = (lo + hi) >> 1;
+    uint64_t midv = unpackHash(blIndex[mid]);
+    if (midv < h) {
+      seg = mid;
+      lo = mid + 1;
+    } else if (midv > h) {
+      hi = mid - 1;
+    } else {
+      return true;
+    }
+  }
+
+  uint32_t startPos = (uint32_t)((uint64_t)seg * (numHashes - 1) / (INDEX_ENTRIES - 1));
+  uint32_t endPos   = (uint32_t)((uint64_t)(seg + 1) * (numHashes - 1) / (INDEX_ENTRIES - 1));
+  if (endPos >= numHashes) endPos = numHashes - 1;
+  uint32_t rangeCount = endPos - startPos + 1;
+  if (rangeCount > (uint32_t)MAX_RANGE) rangeCount = MAX_RANGE;
+
+  blocklist.seek((uint32_t)startPos * HASH_BYTES);
+  blocklist.read(rangeBuf, (uint32_t)rangeCount * HASH_BYTES);
+
+  for (uint32_t i = 0; i < rangeCount; i++) {
+    uint64_t v = unpackHash(rangeBuf + i * HASH_BYTES);
+    if (v == h) return true;
+    if (v > h) break;
   }
   return false;
 }
+
 static bool inCustom(uint64_t h) { for (int i = 0; i < numCustom; i++) if (customHash[i] == h) return true; return false; }
+
+static bool isBlockedHash(uint64_t h) {
+  uint32_t slot = h & (CACHE_SIZE - 1);
+  if (cacheValid[slot]) {
+    uint8_t want[HASH_BYTES]; packHash(h, want);
+    bool same = true;
+    for (int k = 0; k < HASH_BYTES; k++) if (cacheKey[slot][k] != want[k]) { same = false; break; }
+    if (same) return cacheRes[slot] != 0;
+  }
+  bool res = inFlash(h) || inCustom(h);
+  cacheValid[slot] = 1;
+  cacheRes[slot] = res ? 1 : 0;
+  packHash(h, cacheKey[slot]);
+  return res;
+}
+
 static bool isBlocked(const char* domain) {
   const char* p = domain;
   while (p && *p) {
     uint64_t h = fnv40(p, strlen(p));
-    if (inFlash(h) || inCustom(h)) return true;
+    if (isBlockedHash(h)) return true;
     const char* dot = strchr(p, '.'); if (!dot) break;
     const char* next = dot + 1; if (!strchr(next, '.')) break; p = next;
   }
@@ -213,6 +285,7 @@ static void handleBan() {
 static void reopenBlocklist() {
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+  buildFlashIndex();
 }
 static void beginBlocklistSwap() {
   if (blocklist) blocklist.close();
@@ -389,7 +462,11 @@ void setup() {
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); }
+  if (blocklist) {
+    numHashes = blocklist.size() / HASH_BYTES;
+    Serial.printf("blocklist: %u domains\n", numHashes);
+    buildFlashIndex();
+  }
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 

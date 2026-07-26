@@ -6,11 +6,12 @@ A **Pi-hole-style DNS ad-blocker** that runs on a **$2 ESP32-C3** — *no PSRAM 
 
 The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
 domains as **sorted 40-bit hashes in flash** and binary-search them. 140,000+ domains
-fit in ~0.7 MB of flash and are matched in ~10 ms, using **~50 KB of RAM**.
+fit in ~0.7 MB of flash and are matched in ~2 ms, using **~73 KB of RAM**
+(including a 20 KB first-level index and a 2 KB cache).
 
 ```
 query in ──▶ extract domain ──▶ FNV-1a hash (+ parent suffixes)
-         ──▶ binary-search the flash hash table
+         ──▶ check RAM cache / index, then read one flash bucket
               ├─ hit  ──▶ answer 0.0.0.0   (sinkholed)
               └─ miss ──▶ forward to upstream resolver, relay the reply
 ```
@@ -24,8 +25,8 @@ demand PSRAM. This project stores fixed **5-byte (40-bit) hashes in flash** inst
 |---|---|---|
 | Hardware | ESP32 + PSRAM (~$8) | ESP32-C3, no PSRAM (~$2) |
 | 141k domains | ~2.5 MB of RAM | **0.67 MB of flash** |
-| RAM used | most of it | **~50 KB** |
-| Lookup | string compare | ~18 flash reads (~10 ms incl. WiFi RTT) |
+| RAM used | most of it | **~73 KB** |
+| Lookup | string compare | RAM index + cache; ~1 flash read per suffix |
 | Collisions | n/a | 0 at 141k (1 at 537k) |
 
 **Why 40 bits?** It's the sweet spot for this flash budget. Collisions follow the
@@ -138,7 +139,9 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
 - ✅ mDNS (`c3adblock.local`) for discovery
 - ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
-- ⬜ Bloom filter in RAM as a fast pre-filter (skip flash for the ~99% of misses)
+- ✅ Fast pre-filter in RAM — 4096-entry first-level index + direct-mapped cache
+  (replaces ~18 per-step flash reads with ~1 bucket read per suffix)
+- ⬜ Bloom filter in RAM as an even tighter pre-filter (skip flash for the ~99% of misses)
 - ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play
 
 ## Credits
