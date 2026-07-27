@@ -1,4 +1,4 @@
-// C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-C3 (no PSRAM).
+// C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-WEMOS WROOM (no PSRAM).
 // Blocklist = sorted 40-bit FNV-1a hashes in flash, binary-searched.
 // Dashboard at http://c3adblock.local : per-client stats, system info,
 // ban clients, add custom block domains. All control state persisted to flash.
