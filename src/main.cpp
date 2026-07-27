@@ -1,4 +1,4 @@
-// C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-C3 (no PSRAM).
+// C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-WEMOS WROOM (no PSRAM).
 // Blocklist = sorted 40-bit FNV-1a hashes in flash, binary-searched.
 // Dashboard at http://c3adblock.local : per-client stats, system info,
 // ban clients, add custom block domains. All control state persisted to flash.
@@ -13,12 +13,11 @@
 #include <HTTPClient.h>        // remote blocklist fetch
 #include <WiFiClientSecure.h>  // https fetch
 #include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
-#include <DNSServer.h>         // captive-portal catch-all DNS
-#include <Preferences.h>       // NVS store for provisioned WiFi creds
+#include <ArduinoJson.h>
+#include <Preferences.h>
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
-#include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
-                       // have been provisioned via the captive portal (copy secrets.example.h)
+#include "secrets.h"   // defines WIFI_SSID / WIFI_PASS — copy secrets.example.h and fill in
 
 // ---- config ----
 static const IPAddress UPSTREAM(9, 9, 9, 9);     // Quad9
@@ -44,16 +43,50 @@ String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0
 static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
 
+// Variables para las fechas de las listas
+String localListDate = "2026-07-27";
+String githubStevenDate = "Consultando...";
+String githubHageziDate = "Consultando...";
+
+// Temporizador para consultar cada 48 horas (en milisegundos)
+static unsigned long lastGithubCheck = 0;
+const unsigned long GITHUB_CHECK_INTERVAL = 48 * 3600 * 1000UL; // 48 horas
+
+// --- PROTOTIPOS DE FUNCIONES (Evita errores de orden de compilacion) ---
+void loadLocalListDate();
+void saveLocalListDate();
+void checkBlocklistUpdate();
+
 // remote blocklist auto-update
 String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
 uint32_t updateIntervalH = 24;      // hours between auto-fetches
 uint32_t lastCheckMs = 0;
 String updateStatus = "never";
 
-// WiFi provisioning (captive portal)
-Preferences prefs;
-DNSServer   dnsPortal;
-String      portalOpts;             // <option> list of scanned networks, built once at portal start
+// Carga la fecha guardada en la memoria al arrancar
+void loadLocalListDate() {
+  Preferences p;
+  p.begin("adblock", true); // Modo lectura
+  localListDate = p.getString("local_date", "2026-07-27");
+  p.end();
+}
+
+// Guarda la fecha actual (AAAA-MM-DD) cuando se actualiza la lista con éxito
+void saveLocalListDate() {
+  Preferences p;
+  p.begin("adblock", false); // Modo lectura/escritura
+  
+  // Asignamos la fecha de GitHub si está disponible, o usamos la asignada manualmente
+  if (githubStevenDate != "Consultando..." && !githubStevenDate.startsWith("Error")) {
+    localListDate = githubStevenDate;
+  } else if (localListDate == "Sin fecha" || localListDate == "Cargada hoy") {
+    localListDate = "2026-07-27"; 
+  }
+  
+  p.putString("local_date", localListDate);
+  p.end();
+  Serial.println("[NVS] Nueva fecha de lista local guardada: " + localListDate);
+}
 
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
@@ -159,33 +192,97 @@ static int forwardUpstream(int qlen) {
   while (millis() - t0 < 1000) { int sz = upstreamCli.parsePacket(); if (sz > 0) return upstreamCli.read(buf, sizeof(buf)); delay(1); }
   return 0;
 }
-// Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
-// one packet per loop iteration. Returns true if any query was handled this call.
-static bool handleDns() {
-  bool did = false;
-  for (int budget = 0; budget < 16; budget++) {
-    int sz = dnsServer.parsePacket(); if (sz <= 0) break;
-    did = true;
-    IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
-    char domain[256]; uint16_t qtype = 0; int qend = qlen;
-    size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
-    Dev* c = getClient((uint32_t)cip);
-    bool ban = c && c->banned;
-    bool blocked = ban || (dl && numHashes && isBlocked(domain));
-    int rlen;
-    if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-    else         { rlen = forwardUpstream(qlen);     totalAllowed++; if (c) c->allowed++; }
-    if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
-  }
-  return did;
+static void handleDns() {
+  int sz = dnsServer.parsePacket(); if (sz <= 0) return;
+  IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
+  int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) return;
+  char domain[256]; uint16_t qtype = 0; int qend = qlen;
+  size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+  Dev* c = getClient((uint32_t)cip);
+  bool ban = c && c->banned;
+  bool blocked = ban || (dl && numHashes && isBlocked(domain));
+  int rlen;
+  if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
+  else         { rlen = forwardUpstream(qlen);     totalAllowed++; if (c) c->allowed++; }
+  if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
 }
 
 // ---------- web ----------
 static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
 static String jesc(const String& s) { String o; for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; } return o; }
 
-#include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
+const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>C3 AdBlock</title><style>
+body{font:14px system-ui,sans-serif;margin:0;background:#0d1117;color:#c9d1d9}
+header{background:#161b22;padding:14px 18px;border-bottom:1px solid #30363d}
+h1{margin:0;font-size:18px}h1 span{color:#3fb950}.wrap{padding:16px;max-width:1000px;margin:auto}
+.cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;flex:1;min-width:120px}
+.card .v{font-size:22px;font-weight:600}.card .l{color:#8b949e;font-size:12px}
+table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:18px}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:13px}
+th{background:#21262d;color:#8b949e}tr:hover td{background:#1c2128}
+.b{color:#f85149}.a{color:#3fb950}.tag{background:#30363d;border-radius:4px;padding:1px 6px;font-size:11px}
+button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:4px 9px;cursor:pointer}
+button:hover{background:#30363d}.ban{color:#f85149}input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:6px}
+h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
+</style></head><body>
+<header><h1>🛡️ C3 AdBlock <span id=host></span></h1></header><div class=wrap>
+<div class=cards id=sys></div>
+<h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
+<h2>CUSTOM BLOCKED DOMAINS</h2>
+<div style=margin-bottom:8px><input id=dom placeholder="ads.example.com" size=30><button onclick=addDom()>Block domain</button></div>
+<table id=cl><tbody></tbody></table>
+<h2>BLOCKLIST &mdash; UPLOAD</h2>
+<form id=upf style=margin-bottom:6px><input type=file id=blf accept=.bin><button>Upload blocklist</button> <span id=upmsg style=color:#8b949e></span></form>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">build <code>blocklist.bin</code> with <code>tools/build_blocklist.py</code>, then upload here &mdash; no USB</div>
+<h2>BLOCKLIST &mdash; REMOTE AUTO-UPDATE</h2>
+<div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
+<button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
+<h2>FIRMWARE &mdash; OTA UPDATE</h2>
+<form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/wemos_esp32mini/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
+</div><script>
+function fmt(n){return n.toLocaleString()}
+async function load(){let s=await(await fetch('/stats.json')).json();
+host.textContent='@ '+s.ip;
+sys.innerHTML=[
+  ['Total blocked', fmt(s.blocked), 'b'],
+  ['Total allowed', fmt(s.allowed), 'a'],
+  ['Blocklist', fmt(s.domains)+' domains', ''],
+  ['Lista ESP32', s.local_date||'—', 'a'],      // <--- FECHA LOCAL
+  ['StevenBlack', s.gh_steven||'—', 'a'],      // <--- FECHA GITHUB
+  ['HaGeZi Light', s.gh_hagezi||'—', 'a'],     // <--- FECHA GITHUB
+  ['Clients', s.clients.length, ''],
+  ['WiFi', s.rssi+' dBm', ''],
+  ['Temp', s.temp+' °C', ''],
+  ['Free RAM', Math.round(s.heap/1024)+' KB', ''],
+  ['Uptime', s.uptime, '']
+].map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
+ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
+`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
+<td><button class=ban onclick="fetch('/ban?ip=${c.ip}').then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+if(document.activeElement!=uurl)uurl.value=s.upurl||'';
+if(document.activeElement!=uiv)uiv.value=s.upiv||24;
+ustat.textContent=s.upstat||'—';}
+function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()})}}
+function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)).then(load)}
+function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
+fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
+let fd=new FormData();fd.append('f',f);
+try{let r=await fetch('/update',{method:'POST',body:fd});fwmsg.textContent=r.ok?'✓ rebooting, reconnect in ~15s':'✗ '+await r.text();}
+catch(_){fwmsg.textContent='✓ rebooting, reconnect in ~15s';}};
+upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
+upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
+let fd=new FormData();fd.append('f',f);
+try{let r=await fetch('/upload',{method:'POST',body:fd});upmsg.textContent=r.ok?'✓ updated':'✗ '+await r.text();}
+catch(_){upmsg.textContent='✗ upload failed';}
+blf.value='';setTimeout(load,600);};
+load();setInterval(load,3000);
+</script></body></html>)HTML";
 
 static void handleStats() {
   uint32_t up = millis() / 1000;
@@ -193,6 +290,9 @@ static void handleStats() {
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
+             ",\"local_date\":\"" + jesc(localListDate) + "\"" +    // <--- FECHA LISTA EN ESP32
+             ",\"gh_steven\":\"" + jesc(githubStevenDate) + "\"" + // <--- FECHA STEVENBLACK
+             ",\"gh_hagezi\":\"" + jesc(githubHageziDate) + "\"" + // <--- FECHA HAGEZI
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
@@ -208,8 +308,6 @@ static void handleBan() {
 }
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
 static void reopenBlocklist() {
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
@@ -220,10 +318,10 @@ static void beginBlocklistSwap() {
   LittleFS.remove(BLOCKLIST_PATH);
   LittleFS.remove("/blocklist.new");
 }
-static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
+static bool commitNewBlocklist() {                  
   File f = LittleFS.open("/blocklist.new", "r");
   size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
+  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       
   if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
   else    LittleFS.remove("/blocklist.new");
   reopenBlocklist();
@@ -234,6 +332,9 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
 static bool upOk = false;
 static File upFile;
 static void handleUploadDone() {
+  if (upOk) {
+    saveLocalListDate(); // Guarda la fecha actual en NVS
+  }
   web.send(upOk ? 200 : 500, "text/plain",
            upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
 }
@@ -275,10 +376,10 @@ static void saveUpdateCfg() {
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
+  WiFiClientSecure cs; cs.setInsecure();            
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  
   bool https = url.startsWith("https");
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
@@ -295,12 +396,17 @@ static bool fetchBlocklist(String url) {
   }
   f.close(); http.end();
   bool ok = commitNewBlocklist();
+
+  if (ok) {
+    saveLocalListDate(); // Guarda la fecha actual en NVS
+  }
+
   updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
   Serial.printf("[remote] %s\n", updateStatus.c_str());
   return ok;
 }
 
-// ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
+// ---------- firmware OTA ----------
 static void handleFwUpdateDone() {
   bool ok = !Update.hasError();
   web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
@@ -321,96 +427,101 @@ static void handleFwUpload() {
   }
 }
 
-// ---------- WiFi provisioning (captive portal) ----------
-// Try provisioned NVS creds first, then the compile-time secrets.h creds as a
-// fallback (so the maintainer's own device + source builders keep working). If
-// neither connects, fall through to the config portal.
-static bool connectWiFi() {
-  prefs.begin("wifi", true);
-  String ss = prefs.getString("ssid", "");
-  String pw = prefs.getString("pass", "");
-  prefs.end();
-  const char* ssid = ss.length() ? ss.c_str() : WIFI_SSID;
-  const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
-  if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
-  Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(250); Serial.print("."); }
-  Serial.println();
-  return WiFi.status() == WL_CONNECTED;
-}
+// ---------- GitHub Check ----------
+void checkBlocklistUpdate() {
+  if (WiFi.status() != WL_CONNECTED) return;
 
-static void handlePortalRoot() {
-  String html =
-    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>C3 AdBlock setup</title>"
-    "<body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#0d1117;color:#c9d1d9'>"
-    "<h2>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
-    "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
-    "<form method=POST action=/wifisave>"
-    "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
-    "<datalist id=nets>" + portalOpts + "</datalist>"
-    "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
-    "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#3fb950;color:#000;font-weight:600;cursor:pointer'>Connect</button>"
-    "</form></body>";
-  web.send(200, "text/html", html);
-}
-static void handleWifiSave() {
-  String ss = web.arg("s"), pw = web.arg("p");
-  if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
-  prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
-  web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
-                             "&#9989; Saved. Restarting and joining <b>" + ss + "</b>&hellip;<br><br>"
-                             "Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</body>");
-  delay(900); ESP.restart();
-}
-// Never returns — blocks in the portal loop until creds are saved (then reboots).
-static void startConfigPortal() {
-  int n = WiFi.scanNetworks();                 // scan while still in STA mode (no APSTA)
-  portalOpts = "";
-  for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + jesc(WiFi.SSID(i)) + "'>";
-  uint8_t mac[6]; WiFi.macAddress(mac);
-  char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
-  WiFi.mode(WIFI_AP); WiFi.softAP(ap);
-  IPAddress apIP = WiFi.softAPIP();
-  dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
-  web.on("/", handlePortalRoot);
-  web.on("/wifisave", HTTP_POST, handleWifiSave);
-  web.onNotFound(handlePortalRoot);            // any captive-portal probe -> the form
-  web.begin();
-  Serial.printf("\n[setup] No WiFi. Join open network \"%s\" and a setup page pops up (or http://%s)\n",
-                ap, apIP.toString().c_str());
-  while (true) { dnsPortal.processNextRequest(); web.handleClient(); delay(2); }
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  // 1. StevenBlack
+  http.begin(client, "https://api.github.com/repos/StevenBlack/hosts/commits?path=hosts&page=1&per_page=1");
+  http.setUserAgent("ESP32-AdBlock-Checker");
+
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error && doc.is<JsonArray>() && doc.size() > 0) {
+      const char* rawDate = doc[0]["commit"]["committer"]["date"]; 
+      if (rawDate != nullptr) {
+        String fullDate = String(rawDate);
+        githubStevenDate = (fullDate.length() >= 10) ? fullDate.substring(0, 10) : fullDate;
+        Serial.println("[GitHub] StevenBlack: " + githubStevenDate);
+      } else {
+        githubStevenDate = "Formato inválido";
+      }
+    } else {
+      githubStevenDate = "Error JSON";
+    }
+  } else {
+    githubStevenDate = "Error HTTP " + String(httpCode);
+    Serial.printf("[GitHub] Error StevenBlack: %d\n", httpCode);
+  }
+  http.end();
+
+  // 2. HaGeZi Light
+  http.begin(client, "https://api.github.com/repos/hagezi/dns-blocklists/commits?path=adblock/light.txt&page=1&per_page=1");
+  http.setUserAgent("ESP32-AdBlock-Checker");
+
+  httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error && doc.is<JsonArray>() && doc.size() > 0) {
+      const char* rawDate = doc[0]["commit"]["committer"]["date"]; 
+      if (rawDate != nullptr) {
+        String fullDate = String(rawDate);
+        githubHageziDate = (fullDate.length() >= 10) ? fullDate.substring(0, 10) : fullDate;
+        Serial.println("[GitHub] HaGeZi Light: " + githubHageziDate);
+      } else {
+        githubHageziDate = "Formato inválido";
+      }
+    } else {
+      githubHageziDate = "Error JSON";
+    }
+  } else {
+    githubHageziDate = "Error HTTP " + String(httpCode);
+    Serial.printf("[GitHub] Error HaGeZi: %d\n", httpCode);
+  }
+  http.end();
 }
 
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
+  
+  // 1. Cargar fecha desde Flash antes de activar la red
+  loadLocalListDate(); 
+  
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); }
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
-  // Hold BOOT (GPIO9) at power-on to wipe saved WiFi and force the setup portal.
-  pinMode(9, INPUT_PULLUP);
-  if (digitalRead(9) == LOW) { delay(60);
-    if (digitalRead(9) == LOW) { prefs.begin("wifi", false); prefs.clear(); prefs.end();
-      Serial.println("[setup] BOOT held -> cleared saved WiFi"); } }
-
-  if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
-  Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi"); while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.printf("\nWiFi up: %s\n", WiFi.localIP().toString().c_str());
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
+  // 2. Consultar GitHub
+  checkBlocklistUpdate();
+  lastGithubCheck = millis();
+
+  // 3. Iniciar Servicios
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
   web.on("/addblock", []() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/unblock", []() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/forgetwifi", []() { web.send(200, "text/plain", "cleared — rebooting into setup portal");
-    prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
   web.on("/fetchnow", []() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
@@ -420,7 +531,7 @@ void setup() {
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
-  ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
+  ArduinoOTA.setHostname("c3adblock");
   ArduinoOTA.begin();
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }
@@ -428,11 +539,18 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   web.handleClient();
-  bool busy = handleDns();
-  if (updateUrl.length()) {               // periodic remote blocklist auto-update
+  handleDns();
+  if (updateUrl.length()) {               
     uint32_t now = millis();
-    if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
+    if (lastCheckMs == 0) lastCheckMs = now;   
     else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
   }
-  if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
+
+  // Consulta periódica a GitHub cada 48 horas
+  if (millis() - lastGithubCheck >= GITHUB_CHECK_INTERVAL) {
+    lastGithubCheck = millis();
+    checkBlocklistUpdate();
+  }
+
+  delay(1);
 }
