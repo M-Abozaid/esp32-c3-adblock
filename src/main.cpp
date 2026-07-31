@@ -194,6 +194,7 @@ static void handleStats() {
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
+             ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
@@ -202,7 +203,29 @@ static void handleStats() {
   j += "]}";
   web.send(200, "application/json", j);
 }
+// Upstream shipped every state-changing/OTA endpoint with zero authentication —
+// anyone on the LAN could reflash firmware or rewrite the blocklist. Gate them.
+//
+// Basic Auth alone isn't enough here: these are GET endpoints with side effects,
+// and browsers auto-attach cached Basic Auth credentials to *any* request to an
+// already-authenticated origin — including one triggered by a completely
+// unrelated page the victim's browser visits later (e.g. <img src="http://
+// c3adblock.local/forgetwifi">). That's CSRF, and it defeats the LAN-attacker
+// threat model entirely: the attacker doesn't need network access, just to get
+// the victim's browser to fire one request. A custom header can't be attached
+// by a plain <img>/<form> CSRF vector (only same-origin fetch() can set it, and
+// that's exactly what the dashboard's own JS does), so requiring one blocks the
+// drive-by case without needing TLS, cookies, or a token endpoint.
+static const char* CSRF_HEADER = "X-Requested-With";
+static const char* CSRF_VALUE  = "c3-adblock";
+static bool requireAuth() {
+  if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return false; }
+  if (web.authenticate(WEB_USER, WEB_PASS)) return true;
+  web.requestAuthentication();
+  return false;
+}
 static void handleBan() {
+  if (!requireAuth()) return;
   IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
   web.send(200, "text/plain", "ok");
 }
@@ -232,8 +255,10 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
 
 // ---------- OTA blocklist update (browser upload) ----------
 static bool upOk = false;
+static bool upAuthOk = false;
 static File upFile;
 static void handleUploadDone() {
+  if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
            upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
 }
@@ -241,19 +266,23 @@ static void handleUpload() {
   HTTPUpload& u = web.upload();
   switch (u.status) {
     case UPLOAD_FILE_START:
+      upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+      if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false; beginBlocklistSwap();
       upFile = LittleFS.open("/blocklist.new", "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
-      if (upFile) upFile.write(u.buf, u.currentSize);
+      if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
       break;
     case UPLOAD_FILE_END:
+      if (!upAuthOk) break;
       if (upFile) upFile.close();
       upOk = commitNewBlocklist();
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
     case UPLOAD_FILE_ABORTED:
+      if (!upAuthOk) break;
       if (upFile) upFile.close();
       LittleFS.remove("/blocklist.new"); reopenBlocklist();
       Serial.println("[ota] aborted");
@@ -301,7 +330,9 @@ static bool fetchBlocklist(String url) {
 }
 
 // ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
+static bool fwAuthOk = false;
 static void handleFwUpdateDone() {
+  if (!fwAuthOk) { web.requestAuthentication(); return; }
   bool ok = !Update.hasError();
   web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
   if (ok) { delay(300); ESP.restart(); }
@@ -309,14 +340,19 @@ static void handleFwUpdateDone() {
 static void handleFwUpload() {
   HTTPUpload& u = web.upload();
   if (u.status == UPLOAD_FILE_START) {
+    fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+    if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
     Serial.printf("[fw-ota] %s\n", u.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (!fwAuthOk) return;
     if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_END) {
+    if (!fwAuthOk) return;
     if (Update.end(true)) Serial.printf("[fw-ota] %u bytes OK\n", u.totalSize);
     else Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_ABORTED) {
+    if (!fwAuthOk) return;
     Update.abort(); Serial.println("[fw-ota] aborted");
   }
 }
@@ -403,24 +439,32 @@ void setup() {
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
+  if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
+    Serial.println("[WARN] secrets.h still has placeholder WEB_PASS/OTA_PASS — those are public "
+                    "(they're in the repo's example file). Set real values before trusting this "
+                    "device on a network you don't fully control.");
+
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/forgetwifi", []() { web.send(200, "text/plain", "cleared — rebooting into setup portal");
+  web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
     prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
-  web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
-  web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
-  web.on("/fetchnow", []() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
+  web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)
+  web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA (auth inside handleFwUpload)
+  web.on("/fetchnow", []() { if (!requireAuth()) return; fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
   web.on("/setupdate", []() {
+    if (!requireAuth()) return;
     if (web.hasArg("u")) updateUrl = web.arg("u");
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
+  ArduinoOTA.setPassword(OTA_PASS);      // network OTA was unauthenticated upstream
   ArduinoOTA.begin();
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }

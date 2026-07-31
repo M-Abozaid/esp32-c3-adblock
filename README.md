@@ -67,10 +67,15 @@ One USB flash to get going — after that, **firmware and blocklist both update 
 > too old and fails with `AttributeError: ... 'resultcallback'` (issue #4). A one-click browser installer is on the way (hosting TBD).
 
 ```bash
-# 1. (optional) set WiFi creds at compile time — or skip this and use the
-#    on-device setup portal (below). secrets.h is gitignored, stays local.
+# 1. copy the secrets template (gitignored, stays local) and edit it:
+#    - WIFI_SSID / WIFI_PASS are optional — leave the placeholders and use the
+#      on-device setup portal instead (below).
+#    - WEB_USER / WEB_PASS / OTA_PASS are NOT optional: they gate the dashboard's
+#      state-changing endpoints (/ban, /addblock, /upload, /update, /setupdate,
+#      /forgetwifi) and network OTA. Pick real values — these used to be wide
+#      open to anyone on the LAN.
 cp src/secrets.example.h src/secrets.h
-#    then edit src/secrets.h -> WIFI_SSID / WIFI_PASS
+#    then edit src/secrets.h
 
 # 2. build the blocklist hash table (default = StevenBlack base + Hagezi Light,
 #    ~140k domains, WhatsApp/social safe)
@@ -88,8 +93,10 @@ pio device monitor          # -> http://c3adblock.local
 
 If it can't connect (or you never set `secrets.h`), it starts an open access point
 **`C3-AdBlock-XXXX`** with a captive portal — join it from a phone, pick your network,
-type the password, done. To move it to a new network later: open `http://c3adblock.local/forgetwifi`,
-or hold the **BOOT** button while powering on, and the setup portal comes back.
+type the password, done. To move it to a new network later: click **Forget WiFi** on
+the dashboard, or hold the **BOOT** button while powering on, and the setup portal
+comes back. (`/forgetwifi` requires auth now, so it's no longer a bare URL you can
+just visit — see Security below.)
 
 ## Over-the-air updates (no more USB)
 
@@ -107,6 +114,58 @@ The dashboard at **http://c3adblock.local** does it all:
 **4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
 blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
 single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
+
+## Security
+
+The dashboard's read-only view (`/`, `/stats.json`) stays open, but every
+state-changing endpoint requires **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from
+`secrets.h`):
+
+- `/ban`, `/addblock`, `/unblock`, `/forgetwifi`
+- `/upload`, `/update` (blocklist and firmware OTA)
+- `/setupdate`, `/fetchnow`
+
+Network OTA (`ArduinoOTA`, e.g. `pio run -t upload --upload-port c3adblock.local
+--upload-protocol espota`) requires `OTA_PASS` from the same file.
+
+Without this, anyone who could reach the device on the LAN could reflash it
+with arbitrary firmware or rewrite the blocklist with zero credentials — worth
+knowing given the device sits in the path of every DNS query on your network.
+Custom blocked-domain names are also HTML-escaped before being rendered on the
+dashboard, closing a stored-XSS path where a domain string containing markup
+(added via `/addblock`) would otherwise execute in the viewing browser.
+
+**Basic Auth here is a LAN-trust-boundary control, not encryption.** Everything
+is plain HTTP on :80 — this chip has no realistic budget to run a TLS server.
+Basic Auth credentials are base64 (not encrypted) and sent on every authenticated
+request; anyone who can already sniff your LAN traffic (open/guest WiFi, ARP
+spoofing) can read them off the wire. This hardens against the common case —
+another device on your network hitting the API with no credentials at all, or a
+browser tab CSRF'ing it — not against an on-path network attacker.
+
+**CSRF via cached Basic Auth:** browsers auto-attach cached Basic Auth
+credentials to *any* subsequent request to an already-authenticated origin —
+including one triggered by a totally unrelated page the same browser visits
+later (e.g. `<img src="http://c3adblock.local/forgetwifi">`, no JS required).
+That would let any webpage silently drive this API once you've logged into the
+dashboard once, regardless of who's on your LAN. Every mutating endpoint above
+now also requires a custom `X-Requested-With: c3-adblock` header, which a plain
+`<img>`/auto-submitted `<form>` CSRF can't attach (only same-origin `fetch()`
+can, which is what the dashboard's own JS does) — this is why `/forgetwifi` is
+no longer a bare URL you can visit directly; use the dashboard button instead.
+
+**Default credentials:** if `secrets.h` still has the placeholder
+`CHANGE_ME_WEB_PASSWORD` / `CHANGE_ME_OTA_PASSWORD` values from
+`secrets.example.h`, the device boots with a "password" that's public (it's
+sitting in this repo's example file). The firmware logs a warning over serial
+and shows a banner on the dashboard when this is the case — but it will still
+boot and run, so don't skip setting real values in `secrets.h` before trusting
+this on a network you don't fully control.
+
+Out of scope for now: the WiFi setup portal's access point (`C3-AdBlock-XXXX`)
+is still open (unencrypted) by design — it needs to be joinable without knowing
+a password first. The real WiFi password you type into the portal is only as
+safe as that local radio link during the brief setup window.
 
 ## Use it
 
