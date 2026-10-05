@@ -15,10 +15,12 @@
 #include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
+#include <time.h>              // NTP time for TLS certificate validation
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
+#include "certs.h"     // ROOT_CA_BUNDLE for validated HTTPS blocklist downloads
 
 // ---- config ----
 #ifndef UPSTREAM_IP
@@ -591,11 +593,30 @@ static void saveUpdateCfg() {
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
+  bool https = url.startsWith("https");
+  if (https) {
+    // TLS certificate expiry checks need a valid clock. Sync once via NTP;
+    // on failure keep the old list instead of downloading unverified data.
+    if (time(nullptr) < 1704067200) {
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+      uint32_t t0 = millis();
+      while (time(nullptr) < 1704067200 && millis() - t0 < 8000) delay(200);
+    }
+    if (time(nullptr) < 1704067200) {
+      updateStatus = "time not set, TLS verify skipped (kept old list)";
+      Serial.printf("[remote] %s\n", updateStatus.c_str());
+      return false;
+    }
+  }
+  WiFiClientSecure cs;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  if (https) cs.useBuiltinCACertBundle();
+#else
+  if (https) cs.setCACert(ROOT_CA_BUNDLE);
+#endif
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
-  bool https = url.startsWith("https");
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
@@ -750,6 +771,7 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // TLS verify needs wall-clock time
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
   if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
