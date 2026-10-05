@@ -17,9 +17,11 @@ Usage: build_blocklist.py [out.bin] [src ...]
       https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt
 """
 import re
-import sys, os, math, urllib.request
+import sys, os, math, struct, binascii, urllib.request
 
 HASH_BYTES = 5                          # 40-bit hashes -- must match firmware
+BLOCKLIST_VERSION = 1
+BLOCKLIST_MAGIC = b'CADB'
 MASK = (1 << (HASH_BYTES * 8)) - 1
 FNV_OFFSET = 0xcbf29ce484222325
 FNV_PRIME  = 0x100000001b3
@@ -103,11 +105,14 @@ def main():
     hashes = sorted(fnv(d.encode()) for d in domains)
     collisions = len(hashes) - len(set(hashes))
     uniq = sorted(set(hashes))                       # one entry per distinct hash
+    payload = b''.join(h.to_bytes(HASH_BYTES, 'little') for h in uniq)
+    crc = binascii.crc32(payload) & 0xFFFFFFFF
+    header = BLOCKLIST_MAGIC + struct.pack('<HBBII', BLOCKLIST_VERSION, HASH_BYTES, 0, len(uniq), crc)
     with open(out, 'wb') as f:
-        for h in uniq:
-            f.write(h.to_bytes(HASH_BYTES, 'little'))
+        f.write(header)
+        f.write(payload)
 
-    n, size = len(uniq), len(uniq) * HASH_BYTES
+    n, size = len(uniq), len(payload) + len(header)
     print(f'source domains   : {len(domains):,}')
     print(f'hash entries     : {n:,}  ({HASH_BYTES}-byte / {HASH_BYTES*8}-bit)')
     print(f'collisions       : {collisions}  (domains sharing a hash -> over-block)')

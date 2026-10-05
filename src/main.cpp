@@ -32,6 +32,23 @@ static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
+// Versioned blocklist header (16 bytes, little-endian):
+//   magic[4] = 'C','A','D','B', version u16 = 1, hashBytes u8,
+//   reserved u8, count u32, crc32 u32 of payload.
+// Legacy files without a header (flat size % 5 == 0) are still accepted.
+static const uint16_t BLOCKLIST_VERSION = 1;
+static const size_t BLOCKLIST_HEADER_SIZE = 16;
+static uint32_t blocklistOffset = 0;
+
+static uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t len) {
+  crc = ~crc;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int k = 0; k < 8; k++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : crc >> 1;
+  }
+  return ~crc;
+}
 static const int INDEX_ENTRIES = 4096;   // 20 KB first-level flash index
 static const int CACHE_SIZE = 256;       // must be power of 2
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
@@ -95,7 +112,7 @@ static void buildFlashIndex() {
   if (!blocklist || numHashes == 0) return;
   for (int i = 0; i < INDEX_ENTRIES; i++) {
     uint32_t pos = (uint32_t)((uint64_t)i * (numHashes - 1) / (INDEX_ENTRIES - 1));
-    blocklist.seek((uint32_t)pos * HASH_BYTES);
+    blocklist.seek(blocklistOffset + (uint32_t)pos * HASH_BYTES);
     blocklist.read(blIndex[i], HASH_BYTES);
   }
   for (int i = 0; i < CACHE_SIZE; i++) cacheValid[i] = 0;
@@ -127,7 +144,7 @@ static bool inFlash(uint64_t h) {
   uint32_t rangeCount = endPos - startPos + 1;
   if (rangeCount > (uint32_t)MAX_RANGE) rangeCount = MAX_RANGE;
 
-  blocklist.seek((uint32_t)startPos * HASH_BYTES);
+  blocklist.seek(blocklistOffset + (uint32_t)startPos * HASH_BYTES);
   blocklist.read(rangeBuf, (uint32_t)rangeCount * HASH_BYTES);
 
   for (uint32_t i = 0; i < rangeCount; i++) {
@@ -428,22 +445,77 @@ static void handleBan() {
 // Atomic update: the live list keeps serving queries while /blocklist.new is
 // written. Only after full validation the live file is replaced. On any
 // failure the previous list stays active, never an empty slot.
+static bool verifyBlocklistFile(const char* path, uint32_t* outCount, uint32_t* outOffset) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  uint32_t count = 0, offset = 0;
+  bool ok = false;
+  if (sz >= BLOCKLIST_HEADER_SIZE) {
+    uint8_t h[BLOCKLIST_HEADER_SIZE];
+    f.seek(0);
+    if (f.read(h, sizeof(h)) == sizeof(h) &&
+        h[0] == 'C' && h[1] == 'A' && h[2] == 'D' && h[3] == 'B') {
+      uint16_t ver = h[4] | (h[5] << 8);
+      uint8_t hb = h[6];
+      uint32_t cnt = (uint32_t)h[8] | ((uint32_t)h[9] << 8) | ((uint32_t)h[10] << 16) | ((uint32_t)h[11] << 24);
+      uint32_t expectCrc = (uint32_t)h[12] | ((uint32_t)h[13] << 8) | ((uint32_t)h[14] << 16) | ((uint32_t)h[15] << 24);
+      if (ver == BLOCKLIST_VERSION && hb == HASH_BYTES && cnt > 0 &&
+          16 + (size_t)cnt * HASH_BYTES == sz) {
+        uint32_t crc = 0;
+        uint8_t chunk[1024];
+        size_t left = (size_t)cnt * HASH_BYTES;
+        f.seek(16);
+        bool readOk = true;
+        while (left > 0) {
+          size_t n = left > sizeof(chunk) ? sizeof(chunk) : left;
+          size_t got = f.read(chunk, n);
+          if (got != n) { readOk = false; break; }
+          crc = crc32Update(crc, chunk, got);
+          left -= got;
+        }
+        if (readOk && crc == expectCrc) { count = cnt; offset = 16; ok = true; }
+      }
+    }
+  }
+  if (!ok) {
+    // Legacy flat file without header.
+    if (sz > 0 && (sz % HASH_BYTES) == 0) {
+      count = sz / HASH_BYTES;
+      offset = 0;
+      ok = true;
+    }
+  }
+  f.close();
+  if (ok) {
+    if (outCount) *outCount = count;
+    if (outOffset) *outOffset = offset;
+  }
+  return ok;
+}
 static void reopenBlocklist() {
   if (blocklist) blocklist.close();
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
-  buildFlashIndex();
+  uint32_t count = 0, offset = 0;
+  if (verifyBlocklistFile(BLOCKLIST_PATH, &count, &offset)) {
+    blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+    numHashes = count;
+    blocklistOffset = offset;
+    buildFlashIndex();
+    Serial.printf("blocklist: %u domains (%s)\n", numHashes, offset ? "v1 header" : "legacy");
+  } else {
+    numHashes = 0;
+    blocklistOffset = 0;
+    Serial.println("blocklist: missing or invalid");
+  }
 }
 static void beginBlocklistSwap() {
   // Keep the live list open and serving; only drop any stale temp file.
   LittleFS.remove("/blocklist.new");
 }
 static bool validateNewBlocklist(size_t* outCount) {
-  File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0;
-  if (f) f.close();
-  if (sz == 0 || (sz % HASH_BYTES) != 0) return false;
-  if (outCount) *outCount = sz / HASH_BYTES;
+  uint32_t count = 0, offset = 0;
+  if (!verifyBlocklistFile("/blocklist.new", &count, &offset) || count == 0) return false;
+  if (outCount) *outCount = count;
   return true;
 }
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
@@ -475,7 +547,7 @@ static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : "rejected: invalid blocklist file (kept previous)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -661,12 +733,7 @@ void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) {
-    numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    buildFlashIndex();
-  }
+  reopenBlocklist();
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
