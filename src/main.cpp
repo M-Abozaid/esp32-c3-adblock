@@ -15,10 +15,12 @@
 #include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
+#include <time.h>              // NTP time for TLS certificate validation
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
+#include "certs.h"     // ROOT_CA_BUNDLE for validated HTTPS blocklist downloads
 
 // ---- config ----
 #ifndef UPSTREAM_IP
@@ -32,12 +34,30 @@ static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
+// Versioned blocklist header (16 bytes, little-endian):
+//   magic[4] = 'C','A','D','B', version u16 = 1, hashBytes u8,
+//   reserved u8, count u32, crc32 u32 of payload.
+// Legacy files without a header (flat size % 5 == 0) are still accepted.
+static const uint16_t BLOCKLIST_VERSION = 1;
+static const size_t BLOCKLIST_HEADER_SIZE = 16;
+static uint32_t blocklistOffset = 0;
+
+static uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t len) {
+  crc = ~crc;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int k = 0; k < 8; k++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : crc >> 1;
+  }
+  return ~crc;
+}
 static const int INDEX_ENTRIES = 4096;   // 20 KB first-level flash index
 static const int CACHE_SIZE = 256;       // must be power of 2
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
 
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
+WiFiServer dnsTcp(DNS_PORT);
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
@@ -50,7 +70,7 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; uint32_t qWindowMs; uint16_t qCount; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
@@ -94,7 +114,7 @@ static void buildFlashIndex() {
   if (!blocklist || numHashes == 0) return;
   for (int i = 0; i < INDEX_ENTRIES; i++) {
     uint32_t pos = (uint32_t)((uint64_t)i * (numHashes - 1) / (INDEX_ENTRIES - 1));
-    blocklist.seek((uint32_t)pos * HASH_BYTES);
+    blocklist.seek(blocklistOffset + (uint32_t)pos * HASH_BYTES);
     blocklist.read(blIndex[i], HASH_BYTES);
   }
   for (int i = 0; i < CACHE_SIZE; i++) cacheValid[i] = 0;
@@ -126,7 +146,7 @@ static bool inFlash(uint64_t h) {
   uint32_t rangeCount = endPos - startPos + 1;
   if (rangeCount > (uint32_t)MAX_RANGE) rangeCount = MAX_RANGE;
 
-  blocklist.seek((uint32_t)startPos * HASH_BYTES);
+  blocklist.seek(blocklistOffset + (uint32_t)startPos * HASH_BYTES);
   blocklist.read(rangeBuf, (uint32_t)rangeCount * HASH_BYTES);
 
   for (uint32_t i = 0; i < rangeCount; i++) {
@@ -217,10 +237,28 @@ static Dev* getClient(uint32_t ip) {
   for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
+    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = ""; c->qWindowMs = 0; c->qCount = 0;
     getMac(ip, c->mac); return c;
   }
   return nullptr;
+}
+
+// Flood protection policy (documented, tunable at compile time):
+// Home clients burst (browser/DNS prefetch, Android, TVs, consoles), so the
+// limit is a 1-second sliding window, not a hard per-burst cap. Over-limit
+// queries are dropped without a reply: the client times out and retries,
+// while the DNS task stays responsive for everyone else. Increase for very
+// busy networks, decrease for weak upstreams.
+#ifndef DNS_MAX_QPS
+#define DNS_MAX_QPS 50
+#endif
+static bool allowQuery(Dev* c) {
+  if (!c) return true;
+  uint32_t now = millis();
+  if (now - c->qWindowMs >= 1000) { c->qWindowMs = now; c->qCount = 0; }
+  if (c->qCount >= DNS_MAX_QPS) return false;
+  c->qCount++;
+  return true;
 }
 
 // ---------- DNS ----------
@@ -233,11 +271,26 @@ static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype
   if (o > 4 && strncmp(out, "www.", 4) == 0) { memmove(out, out + 4, o - 3); o -= 4; }
   return o;
 }
+// Sinkhole policy for blocked domains:
+//   A (1)    -> 0.0.0.0
+//   AAAA(28) -> ::
+//   other types -> NODATA (NOERROR, ANCOUNT=0), never forwarded upstream.
+// This prevents IPv6 leaks where a blocked domain would still resolve via AAAA.
+// The reply keeps question + single answer only (NSCOUNT=ARCOUNT=0) so EDNS OPT
+// records from the query are stripped and the reply stays well-formed.
+static const uint16_t QTYPE_A = 1;
+static const uint16_t QTYPE_AAAA = 28;
 static int buildBlocked(int qend, uint16_t qtype) {
-  buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == 1) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
-  if (qtype != 1) return qend;
-  const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
-  memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == QTYPE_A || qtype == QTYPE_AAAA) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
+  if (qtype == QTYPE_A) {
+    const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
+    memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  }
+  if (qtype == QTYPE_AAAA) {
+    const uint8_t ans[] = {0xC0,0x0C, 0,28, 0,1, 0,0,1,0x2C, 0,16, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  }
+  return qend;
 }
 // Forward to upstream and wait for the reply that actually belongs to THIS query.
 // Issue #10: after one timeout the late reply used to sit in the socket and get relayed
@@ -277,18 +330,97 @@ static bool handleDns() {
     int sz = dnsServer.parsePacket(); if (sz <= 0) break;
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 12) continue;
+    // Validate header: must be a standard query with exactly one question.
+    // EDNS OPT records live past qend and are forwarded untouched; blocked
+    // replies strip them (see buildBlocked) to stay well-formed.
+    uint16_t qdcount = (buf[4] << 8) | buf[5];
+    bool isQuery = (buf[2] & 0x80) == 0;
+    uint8_t opcode = (buf[2] >> 3) & 0x0F;
+    if (!isQuery || opcode != 0 || qdcount != 1) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+    if (!dl) continue;  // malformed: drop instead of forwarding upstream
     Dev* c = getClient((uint32_t)cip);
+    if (!allowQuery(c)) continue;  // flood protection: drop without reply
     bool ban = c && c->banned;
-    bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
+    bool blocked = ban || (blockingOn && numHashes && isBlocked(domain));
     int rlen;
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
     if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
   }
   return did;
+}
+
+// Minimal TCP DNS for truncated and DNSSEC replies.
+// Modern clients retry over TCP when the UDP TC bit is set or the answer is
+// large. Stateful and non-blocking: one pending client progresses a little per
+// loop call with an 800ms total budget, so a slow TCP client never stalls UDP
+// DNS, the dashboard or OTA.
+static WiFiClient tcpPending;
+static uint32_t tcpStartMs = 0;
+static uint16_t tcpWant = 0;  // 0 = reading 2-byte length prefix
+static uint8_t tcpLenBuf[2];
+static uint8_t tcpLenGot = 0;
+static size_t tcpGot = 0;
+static const uint32_t TCP_BUDGET_MS = 800;
+static void tcpReset() {
+  if (tcpPending) tcpPending.stop();
+  tcpPending = WiFiClient();
+  tcpWant = 0; tcpLenGot = 0; tcpGot = 0; tcpStartMs = 0;
+}
+static bool handleDnsTcp() {
+  if (!tcpPending || !tcpPending.connected()) {
+    if (!dnsTcp.hasClient()) { tcpReset(); return false; }
+    tcpPending = dnsTcp.available();
+    if (!tcpPending) return false;
+    tcpStartMs = millis();
+    tcpWant = 0; tcpLenGot = 0; tcpGot = 0;
+  }
+  uint32_t now = millis();
+  if (now - tcpStartMs > TCP_BUDGET_MS) { tcpReset(); return true; }  // drop slow client
+  if (tcpWant == 0) {
+    while (tcpPending.available() && tcpLenGot < 2)
+      tcpLenBuf[tcpLenGot++] = tcpPending.read();
+    if (tcpLenGot < 2) return true;  // wait for more bytes next loop
+    uint16_t tlen = (tcpLenBuf[0] << 8) | tcpLenBuf[1];
+    if (tlen < 12 || tlen > sizeof(buf)) { tcpReset(); return true; }
+    tcpWant = tlen;
+    tcpGot = 0;
+  }
+  while (tcpPending.available() && tcpGot < tcpWant) {
+    int n = tcpPending.read(buf + tcpGot, tcpWant - tcpGot);
+    if (n <= 0) break;
+    tcpGot += n;
+  }
+  if (tcpGot < tcpWant) return true;  // incomplete: continue next loop
+  int rlen = 0;
+  {
+    uint16_t qdcount = (buf[4] << 8) | buf[5];
+    bool isQuery = (buf[2] & 0x80) == 0;
+    uint8_t opcode = (buf[2] >> 3) & 0x0F;
+    char domain[256]; uint16_t qtype = 0; int qend = tcpWant;
+    size_t dl = 0;
+    if (isQuery && opcode == 0 && qdcount == 1)
+      dl = parseQuery(buf, tcpWant, domain, &qtype, &qend);
+    if (dl) {
+      Dev* c = getClient((uint32_t)tcpPending.remoteIP());
+      if (allowQuery(c)) {
+        bool ban = c && c->banned;
+        bool blocked = ban || (blockingOn && numHashes && isBlocked(domain));
+        if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
+        else { rlen = forwardUpstream(tcpWant, qend); totalAllowed++; if (c) c->allowed++; }
+      }
+    }
+  }
+  if (rlen > 0) {
+    tcpPending.write((uint8_t)(rlen >> 8));
+    tcpPending.write((uint8_t)(rlen & 0xFF));
+    tcpPending.write(buf, rlen);
+  }
+  tcpReset();
+  return true;
 }
 
 // ---------- web ----------
@@ -343,27 +475,128 @@ static void handleBan() {
 }
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
+// Safe update with rollback (not a filesystem transaction): the live list keeps
+// serving queries while /blocklist.new is written. Only after full validation
+// the live file is replaced via live -> previous -> new renames. There is a
+// short window with no live file; numHashes is zeroed during the swap so DNS
+// fail-opens instead of reading a closed handle. On boot, a missing live file
+// is recovered from previous/new if valid.
+static bool verifyBlocklistFile(const char* path, uint32_t* outCount, uint32_t* outOffset) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  if (sz < 4) { f.close(); return false; }
+  uint8_t magic[4];
+  f.seek(0);
+  if (f.read(magic, sizeof(magic)) != sizeof(magic)) { f.close(); return false; }
+  bool hasMagic = magic[0] == 'C' && magic[1] == 'A' && magic[2] == 'D' && magic[3] == 'B';
+  if (hasMagic) {
+    // Versioned file: any header/payload mismatch is a hard reject.
+    // Never fall back to legacy for CADB-prefixed data.
+    bool ok = false;
+    uint32_t count = 0;
+    if (sz >= BLOCKLIST_HEADER_SIZE) {
+      uint8_t h[BLOCKLIST_HEADER_SIZE];
+      f.seek(0);
+      if (f.read(h, sizeof(h)) == sizeof(h)) {
+        uint16_t ver = h[4] | (h[5] << 8);
+        uint8_t hb = h[6];
+        uint32_t cnt = (uint32_t)h[8] | ((uint32_t)h[9] << 8) | ((uint32_t)h[10] << 16) | ((uint32_t)h[11] << 24);
+        uint32_t expectCrc = (uint32_t)h[12] | ((uint32_t)h[13] << 8) | ((uint32_t)h[14] << 16) | ((uint32_t)h[15] << 24);
+        if (ver == BLOCKLIST_VERSION && hb == HASH_BYTES && cnt > 0 &&
+            16 + (size_t)cnt * HASH_BYTES == sz) {
+          uint32_t crc = 0;
+          uint8_t chunk[1024];
+          size_t left = (size_t)cnt * HASH_BYTES;
+          f.seek(16);
+          bool readOk = true;
+          while (left > 0) {
+            size_t n = left > sizeof(chunk) ? sizeof(chunk) : left;
+            size_t got = f.read(chunk, n);
+            if (got != n) { readOk = false; break; }
+            crc = crc32Update(crc, chunk, got);
+            left -= got;
+          }
+          if (readOk && crc == expectCrc) { count = cnt; ok = true; }
+        }
+      }
+    }
+    f.close();
+    if (ok) {
+      if (outCount) *outCount = count;
+      if (outOffset) *outOffset = BLOCKLIST_HEADER_SIZE;
+    }
+    return ok;
+  }
+  // Legacy flat file without header.
+  f.close();
+  if (sz > 0 && (sz % HASH_BYTES) == 0) {
+    if (outCount) *outCount = sz / HASH_BYTES;
+    if (outOffset) *outOffset = 0;
+    return true;
+  }
+  return false;
+}
 static void reopenBlocklist() {
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
-  buildFlashIndex();
+  if (blocklist) blocklist.close();
+  uint32_t count = 0, offset = 0;
+  if (verifyBlocklistFile(BLOCKLIST_PATH, &count, &offset)) {
+    blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+    numHashes = count;
+    blocklistOffset = offset;
+    buildFlashIndex();
+    Serial.printf("blocklist: %u domains (%s)\n", numHashes, offset ? "v1 header" : "legacy");
+    return;
+  }
+  // Boot recovery after a crash between renames: prefer previous, then new.
+  if (verifyBlocklistFile("/blocklist.previous", &count, &offset)) {
+    LittleFS.remove(BLOCKLIST_PATH);
+    LittleFS.rename("/blocklist.previous", BLOCKLIST_PATH);
+    reopenBlocklist();
+    return;
+  }
+  if (verifyBlocklistFile("/blocklist.new", &count, &offset)) {
+    LittleFS.remove(BLOCKLIST_PATH);
+    LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
+    reopenBlocklist();
+    return;
+  }
+  numHashes = 0;
+  blocklistOffset = 0;
+  Serial.println("blocklist: missing or invalid");
 }
 static void beginBlocklistSwap() {
-  if (blocklist) blocklist.close();
-  numHashes = 0;
-  LittleFS.remove(BLOCKLIST_PATH);
+  // Keep the live list open and serving; only drop any stale temp file.
   LittleFS.remove("/blocklist.new");
 }
+static bool validateNewBlocklist(size_t* outCount) {
+  uint32_t count = 0, offset = 0;
+  if (!verifyBlocklistFile("/blocklist.new", &count, &offset) || count == 0) return false;
+  if (outCount) *outCount = count;
+  return true;
+}
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
-  File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
+  size_t count = 0;
+  if (!validateNewBlocklist(&count) || count == 0) {
+    LittleFS.remove("/blocklist.new");
+    return false;  // live list untouched
+  }
+  if (blocklist) blocklist.close();
+  numHashes = 0;  // fail-open during the rename window; never read a closed handle
+  LittleFS.remove("/blocklist.previous");
+  // Keep one rollback copy: live -> previous, new -> live.
+  // Not a true atomic transaction: a crash here is recovered on boot.
+  if (LittleFS.exists(BLOCKLIST_PATH))
+    LittleFS.rename(BLOCKLIST_PATH, "/blocklist.previous");
+  if (!LittleFS.rename("/blocklist.new", BLOCKLIST_PATH)) {
+    // Rename failed: try to restore live from rollback.
+    if (LittleFS.exists("/blocklist.previous"))
+      LittleFS.rename("/blocklist.previous", BLOCKLIST_PATH);
+    reopenBlocklist();
+    return false;
+  }
   reopenBlocklist();
-  return ok;
+  return numHashes > 0;
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
@@ -373,7 +606,7 @@ static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : "rejected: invalid blocklist file (kept previous)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -397,8 +630,8 @@ static void handleUpload() {
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
-      Serial.println("[ota] aborted");
+      LittleFS.remove("/blocklist.new");  // live list was never touched
+      Serial.println("[ota] aborted, kept previous blocklist");
       break;
   }
 }
@@ -417,19 +650,48 @@ static void saveUpdateCfg() {
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
+  bool https = url.startsWith("https");
+  if (https) {
+    // TLS certificate expiry checks need a valid clock. Sync once via NTP;
+    // on failure keep the old list instead of downloading unverified data.
+    if (time(nullptr) < 1704067200) {
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+      uint32_t t0 = millis();
+      while (time(nullptr) < 1704067200 && millis() - t0 < 8000) delay(200);
+    }
+    if (time(nullptr) < 1704067200) {
+      updateStatus = "time not set, TLS verify skipped (kept old list)";
+      Serial.printf("[remote] %s\n", updateStatus.c_str());
+      return false;
+    }
+  }
+  WiFiClientSecure cs;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  if (https) cs.useBuiltinCACertBundle();
+#else
+  if (https) cs.setCACert(ROOT_CA_BUNDLE);
+#endif
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
-  bool https = url.startsWith("https");
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
+  int len = http.getSize();
+  // Guard against oversized payloads before touching the filesystem.
+  // C3 LittleFS is ~1.3MB; S3 build allows much more, so cap at 14MB.
+  const size_t MAX_BLOCKLIST_BYTES = 14 * 1024 * 1024;
+  if (len > (int)MAX_BLOCKLIST_BYTES) { http.end(); updateStatus = "too large (" + String(len) + "B)"; return false; }
+  size_t freeBytes = LittleFS.totalBytes() > LittleFS.usedBytes() ? LittleFS.totalBytes() - LittleFS.usedBytes() : 0;
+  if (len > 0 && (size_t)len + 65536 > freeBytes + 1024) {
+    // Not enough room for temp + live during swap; keep serving the old list.
+    http.end(); updateStatus = "no space for update"; return false;
+  }
   beginBlocklistSwap();
   File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+  if (!f) { http.end(); updateStatus = "fs open failed"; return false; }  // live list untouched
   WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
     if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
@@ -549,12 +811,7 @@ void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) {
-    numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    buildFlashIndex();
-  }
+  reopenBlocklist();
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
@@ -571,6 +828,7 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // TLS verify needs wall-clock time
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
   if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
@@ -578,7 +836,7 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
-  dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  dnsServer.begin(DNS_PORT); upstreamCli.begin(0); dnsTcp.begin(); dnsTcp.setNoDelay(true);
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
@@ -607,13 +865,14 @@ void setup() {
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
   ArduinoOTA.setPassword(OTA_PASS);      // network OTA was unauthenticated upstream
   ArduinoOTA.begin();
-  Serial.println("DNS :53 + dashboard :80 + OTA up");
+  Serial.println("DNS :53 (UDP+TCP) + dashboard :80 + OTA up");
 }
 
 void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
+  busy |= handleDnsTcp();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();

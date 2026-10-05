@@ -23,11 +23,18 @@ jobs:
         run: python3 tools/build_blocklist.py blocklist.bin 2>&1 | tee build.log
       - name: Sanity checks
         run: |
-          size=$(stat -c%s blocklist.bin)
-          echo "size=$size bytes"
-          test $((size % 5)) -eq 0                  # whole 40-bit entries
-          test "$size" -gt 250000                   # >50k entries, catches a silently shrunk list
-          test "$size" -lt 1300000                  # fits the dual-OTA filesystem partition
+          python3 - <<'PY'
+          import struct, binascii, sys
+          d = open('blocklist.bin','rb').read()
+          assert d[0:4] == b'CADB', 'missing CADB magic'
+          ver, hb, res, cnt, crc = struct.unpack('<HBBII', d[4:16])
+          assert ver == 1 and hb == 5, f'bad header {ver} {hb}'
+          assert 16 + cnt * 5 == len(d), 'size mismatch'
+          assert (binascii.crc32(d[16:]) & 0xFFFFFFFF) == crc, 'CRC mismatch'
+          assert cnt > 50000, 'list shrank unexpectedly'
+          assert len(d) < 1300000, 'does not fit dual-OTA filesystem'
+          print(f'header OK: {cnt} entries, {len(d)} bytes')
+          PY
       - name: Publish to the 'blocklist' release
         env:
           GH_TOKEN: ${{ github.token }}
