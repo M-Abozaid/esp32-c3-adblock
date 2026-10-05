@@ -425,27 +425,47 @@ static void handleBan() {
 }
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
+// Atomic update: the live list keeps serving queries while /blocklist.new is
+// written. Only after full validation the live file is replaced. On any
+// failure the previous list stays active, never an empty slot.
 static void reopenBlocklist() {
+  if (blocklist) blocklist.close();
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
   buildFlashIndex();
 }
 static void beginBlocklistSwap() {
-  if (blocklist) blocklist.close();
-  numHashes = 0;
-  LittleFS.remove(BLOCKLIST_PATH);
+  // Keep the live list open and serving; only drop any stale temp file.
   LittleFS.remove("/blocklist.new");
 }
-static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
+static bool validateNewBlocklist(size_t* outCount) {
   File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
+  size_t sz = f ? f.size() : 0;
+  if (f) f.close();
+  if (sz == 0 || (sz % HASH_BYTES) != 0) return false;
+  if (outCount) *outCount = sz / HASH_BYTES;
+  return true;
+}
+static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
+  size_t count = 0;
+  if (!validateNewBlocklist(&count) || count == 0) {
+    LittleFS.remove("/blocklist.new");
+    return false;  // live list untouched
+  }
+  if (blocklist) blocklist.close();
+  LittleFS.remove("/blocklist.previous");
+  // Keep one rollback copy: live -> previous, new -> live.
+  if (LittleFS.exists(BLOCKLIST_PATH))
+    LittleFS.rename(BLOCKLIST_PATH, "/blocklist.previous");
+  if (!LittleFS.rename("/blocklist.new", BLOCKLIST_PATH)) {
+    // Rename failed: try to restore live from rollback.
+    if (LittleFS.exists("/blocklist.previous"))
+      LittleFS.rename("/blocklist.previous", BLOCKLIST_PATH);
+    reopenBlocklist();
+    return false;
+  }
   reopenBlocklist();
-  return ok;
+  return numHashes > 0;
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
@@ -479,8 +499,8 @@ static void handleUpload() {
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
-      Serial.println("[ota] aborted");
+      LittleFS.remove("/blocklist.new");  // live list was never touched
+      Serial.println("[ota] aborted, kept previous blocklist");
       break;
   }
 }
@@ -507,11 +527,21 @@ static bool fetchBlocklist(String url) {
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
+  int len = http.getSize();
+  // Guard against oversized payloads before touching the filesystem.
+  // C3 LittleFS is ~1.3MB; S3 build allows much more, so cap at 14MB.
+  const size_t MAX_BLOCKLIST_BYTES = 14 * 1024 * 1024;
+  if (len > (int)MAX_BLOCKLIST_BYTES) { http.end(); updateStatus = "too large (" + String(len) + "B)"; return false; }
+  size_t freeBytes = LittleFS.totalBytes() > LittleFS.usedBytes() ? LittleFS.totalBytes() - LittleFS.usedBytes() : 0;
+  if (len > 0 && (size_t)len + 65536 > freeBytes + 1024) {
+    // Not enough room for temp + live during swap; keep serving the old list.
+    http.end(); updateStatus = "no space for update"; return false;
+  }
   beginBlocklistSwap();
   File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+  if (!f) { http.end(); updateStatus = "fs open failed"; return false; }  // live list untouched
   WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
     if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
