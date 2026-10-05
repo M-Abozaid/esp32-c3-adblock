@@ -433,7 +433,14 @@ static void getMac(uint32_t ip, uint8_t* mac) {
     if (etharp_find_addr(nif, &ipa, &eth, &ipret) >= 0 && eth) { memcpy(mac, eth->addr, 6); return; }
 }
 static Dev* getClient(uint32_t ip) {
-  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
+  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) {
+    clients[i].lastSeen = millis();
+    // ARP may have resolved after entry creation: fill in a previously
+    // unknown MAC so per-client policy starts applying. Never overwrites
+    // a known MAC.
+    if (macIsZero(clients[i].mac)) getMac(ip, clients[i].mac);
+    return &clients[i];
+  }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
     c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = ""; c->qWindowMs = 0; c->qCount = 0;
