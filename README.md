@@ -115,9 +115,9 @@ One USB flash to get going — after that, **firmware and blocklist both update 
 #    - WIFI_SSID / WIFI_PASS are optional — leave the placeholders and use the
 #      on-device setup portal instead (below).
 #    - WEB_USER / WEB_PASS / OTA_PASS are NOT optional: they gate the dashboard's
-#      state-changing endpoints (/ban, /addblock, /upload, /update, /setupdate,
-#      /forgetwifi) and network OTA. Pick real values — these used to be wide
-#      open to anyone on the LAN.
+#      state-changing endpoints (/ban, /addblock, /setalias, /addclientblock,
+#      /upload, /update, /setupdate, /forgetwifi) and network OTA. Pick real
+#      values — these used to be wide open to anyone on the LAN.
 cp src/secrets.example.h src/secrets.h
 #    then edit src/secrets.h
 
@@ -184,6 +184,7 @@ state-changing endpoint requires **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from
 `secrets.h`):
 
 - `/ban`, `/addblock`, `/unblock`, `/forgetwifi`
+- `/setalias`, `/addclientblock`, `/unclientblock` (per-client policies)
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`
 
@@ -193,7 +194,7 @@ Network OTA (`ArduinoOTA`, e.g. `pio run -t upload --upload-port c3adblock.local
 Without this, anyone who could reach the device on the LAN could reflash it
 with arbitrary firmware or rewrite the blocklist with zero credentials — worth
 knowing given the device sits in the path of every DNS query on your network.
-Custom blocked-domain names are also HTML-escaped before being rendered on the
+Custom blocked-domain names and client aliases are also HTML-escaped before being rendered on the
 dashboard, closing a stored-XSS path where a domain string containing markup
 (added via `/addblock`) would otherwise execute in the viewing browser.
 
@@ -238,6 +239,28 @@ your main DNS. Test:
 dig @<c3-ip> doubleclick.net   # -> 0.0.0.0  (blocked)
 dig @<c3-ip> github.com        # -> real IP  (forwarded)
 ```
+
+## Blocking levels
+
+Three layers, checked in order for every query:
+
+1. **Global blocklist** (`blocklist.bin`, ~100k hashed domains) — affects everyone.
+   Managed via dashboard upload or remote auto-update. Never shown in full on
+   the dashboard.
+2. **Global custom blocked domains** (`/addblock`) — affects everyone.
+3. **Per-client blocked domains** (dashboard Clients → Manage) — affects only
+   one client. A rule like `tiktok.com` also covers `www`/`api`/`m` subdomains
+   but never `notiktok.com`. Banned clients stay fully sinkholed as before.
+
+Client identity is the **MAC address** (resolved via ARP), so rules survive
+DHCP IP changes. Give each client an alias (e.g. `Pedro Celular`) — it's display
+metadata only and never affects matching. Limitation: phones/tablets with Wi-Fi
+**MAC randomization** (private address) appear as a new client each time the
+address rotates; policies follow the current MAC.
+
+Aliases and per-client rules persist across reboots in LittleFS
+(`/clientpol.txt`). Limits: 32 managed clients, 16 blocked domains each,
+alias up to 32 chars.
 
 ## Gotchas (learned the hard way)
 
