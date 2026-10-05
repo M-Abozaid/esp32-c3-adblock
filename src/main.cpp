@@ -221,14 +221,20 @@ static bool isValidDomain(String d) {
   }
   return labels >= 2;
 }
-// Update URL policy: http/https only, length capped, no control chars.
-// Private/LAN hosts are allowed because only an authenticated admin can set
-// the URL (documented SSRF surface, not an unauthenticated vector).
+// Update URL policy: HTTPS only by default. Plain HTTP would let a LAN
+// attacker replace the blocklist (CRC32 cannot detect that), so it is
+// rejected unless the build explicitly opts in with -DALLOW_HTTP_BLOCKLIST=1
+// for isolated LAN testing. Private/LAN hosts are allowed because only an
+// authenticated admin can set the URL (documented SSRF surface).
 static bool isValidUpdateUrl(const String& u) {
   if (u.length() < 8 || u.length() > 200) return false;
   if (hasControlChars(u)) return false;
   if (u.indexOf(' ') >= 0) return false;
+#ifdef ALLOW_HTTP_BLOCKLIST
   return u.startsWith("https://") || u.startsWith("http://");
+#else
+  return u.startsWith("https://");
+#endif
 }
 // ---------- persistence ----------
 static void loadCustom() {
@@ -568,12 +574,19 @@ static void authNote(uint32_t ip, bool ok) {
   if (++authFails[slot].fails == 5) authFails[slot].untilMs = now + 30000UL;
   else if (authFails[slot].fails >= 10) authFails[slot].untilMs = now + 300000UL;
 }
+// Single credential check shared by requireAuth() and both upload handlers,
+// so brute-force accounting can never diverge between auth paths.
+static bool checkCredentials() {
+  uint32_t rip = (uint32_t)web.client().remoteIP();
+  bool ok = !authLocked(rip) && web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+  authNote(rip, ok);
+  return ok;
+}
 static bool requireAuth() {
   uint32_t rip = (uint32_t)web.client().remoteIP();
   if (authLocked(rip)) { web.send(429, "text/plain", "too many failures, retry later"); return false; }
   if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return false; }
-  if (web.authenticate(WEB_USER, WEB_PASS)) { authNote(rip, true); return true; }
-  authNote(rip, false);
+  if (checkCredentials()) return true;
   web.requestAuthentication();
   return false;
 }
@@ -725,9 +738,7 @@ static void handleUpload() {
   HTTPUpload& u = web.upload();
   switch (u.status) {
     case UPLOAD_FILE_START: {
-      uint32_t rip = (uint32_t)web.client().remoteIP();
-      upAuthOk = !authLocked(rip) && web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
-      authNote(rip, upAuthOk);
+      upAuthOk = checkCredentials();
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false; beginBlocklistSwap();
       upTotal = 0;
@@ -767,7 +778,7 @@ static void loadUpdateCfg() {
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
   f.close();
   if (updateIntervalH < 1) updateIntervalH = 1; if (updateIntervalH > 720) updateIntervalH = 720;
-  if (updateUrl.length() > 200 || hasControlChars(updateUrl)) updateUrl = "";
+  if (!isValidUpdateUrl(updateUrl)) updateUrl = "";
 }
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
@@ -839,9 +850,7 @@ static void handleFwUpdateDone() {
 static void handleFwUpload() {
   HTTPUpload& u = web.upload();
   if (u.status == UPLOAD_FILE_START) {
-    uint32_t rip = (uint32_t)web.client().remoteIP();
-    fwAuthOk = !authLocked(rip) && web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
-    authNote(rip, fwAuthOk);
+    fwAuthOk = checkCredentials();
     if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
     Serial.println("[fw-ota] receiving firmware upload");
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
@@ -1007,7 +1016,7 @@ void setup() {
     if (!requireAuth()) return;
     if (web.hasArg("u")) {
       String u = web.arg("u"); u.trim();
-      if (u.length() && !isValidUpdateUrl(u)) { web.send(400, "text/plain", "invalid URL (http/https, max 200 chars)"); return; }
+      if (u.length() && !isValidUpdateUrl(u)) { web.send(400, "text/plain", "invalid URL (https only, max 200 chars)"); return; }
       updateUrl = u;
     }
     if (web.hasArg("h")) { long h = web.arg("h").toInt(); if (h < 1) h = 1; if (h > 720) h = 720; updateIntervalH = (uint32_t)h; }

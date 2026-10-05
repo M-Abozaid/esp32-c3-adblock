@@ -3,9 +3,9 @@
 // - Arduino 3.x: useBuiltinCACertBundle() (Mozilla bundle maintained by Espressif).
 // - Arduino 2.x: setCACert(ROOT_CA_BUNDLE) below (ISRG Root X1 + DigiCert
 //   Global Root CA/G2, enough for github.com -> release CDN redirects).
-// Maintenance: if GitHub/CDN rotates to a new root, refresh this bundle from
-// https://curl.se/ca/cacert.pem or the vendor CA pages and reflash. Plain HTTP
-// URLs skip TLS entirely (LAN testing only). CRC32 in the v1 header detects
+// Maintenance: if GitHub/CDN rotates to a new root, refresh with
+// python3 tools/refresh_certs.py --write, then rebuild and re-run the TLS
+// fetch test. Plain HTTP URLs skip TLS entirely (LAN testing only). CRC32 in the v1 header detects
 // accidental corruption/truncation; it is NOT content authentication — a future
 // step is detached Ed25519 signatures verified on device.
 // If the remote uses another CA, the fetch fails closed and the old list is kept.
