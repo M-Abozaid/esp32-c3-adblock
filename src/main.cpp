@@ -38,6 +38,7 @@ static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up
 
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
+WiFiServer dnsTcp(DNS_PORT);
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
@@ -327,6 +328,51 @@ static bool handleDns() {
   return did;
 }
 
+// Minimal TCP DNS for truncated and DNSSEC replies.
+// Modern clients retry over TCP when the UDP TC bit is set or the answer is
+// large. Handle one TCP query per call without blocking the UDP path.
+static bool handleDnsTcp() {
+  WiFiClient tc = dnsTcp.available();
+  if (!tc) return false;
+  uint32_t t0 = millis();
+  while (tc.connected() && tc.available() < 2 && millis() - t0 < 2000) delay(1);
+  if (tc.available() < 2) { tc.stop(); return true; }
+  uint16_t tlen = (tc.read() << 8) | tc.read();
+  if (tlen < 12 || tlen > sizeof(buf)) { tc.stop(); return true; }
+  size_t got = 0;
+  while (tc.connected() && got < tlen && millis() - t0 < 2000) {
+    int n = tc.read(buf + got, tlen - got);
+    if (n > 0) got += n;
+    else delay(1);
+  }
+  int rlen = 0;
+  if (got == tlen) {
+    uint16_t qdcount = (buf[4] << 8) | buf[5];
+    bool isQuery = (buf[2] & 0x80) == 0;
+    uint8_t opcode = (buf[2] >> 3) & 0x0F;
+    char domain[256]; uint16_t qtype = 0; int qend = tlen;
+    size_t dl = 0;
+    if (isQuery && opcode == 0 && qdcount == 1)
+      dl = parseQuery(buf, tlen, domain, &qtype, &qend);
+    if (dl) {
+      Dev* c = getClient((uint32_t)tc.remoteIP());
+      if (allowQuery(c)) {
+        bool ban = c && c->banned;
+        bool blocked = ban || (blockingOn && numHashes && isBlocked(domain));
+        if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
+        else { rlen = forwardUpstream(tlen, qend); totalAllowed++; if (c) c->allowed++; }
+      }
+    }
+  }
+  if (rlen > 0) {
+    tc.write((uint8_t)(rlen >> 8));
+    tc.write((uint8_t)(rlen & 0xFF));
+    tc.write(buf, rlen);
+  }
+  tc.stop();
+  return true;
+}
+
 // ---------- web ----------
 static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
 static String jesc(const String& s) { String o; for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; } return o; }
@@ -614,7 +660,7 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
-  dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  dnsServer.begin(DNS_PORT); upstreamCli.begin(0); dnsTcp.begin(); dnsTcp.setNoDelay(true);
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
@@ -643,13 +689,14 @@ void setup() {
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
   ArduinoOTA.setPassword(OTA_PASS);      // network OTA was unauthenticated upstream
   ArduinoOTA.begin();
-  Serial.println("DNS :53 + dashboard :80 + OTA up");
+  Serial.println("DNS :53 (UDP+TCP) + dashboard :80 + OTA up");
 }
 
 void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
+  busy |= handleDnsTcp();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
