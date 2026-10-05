@@ -233,11 +233,26 @@ static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype
   if (o > 4 && strncmp(out, "www.", 4) == 0) { memmove(out, out + 4, o - 3); o -= 4; }
   return o;
 }
+// Sinkhole policy for blocked domains:
+//   A (1)    -> 0.0.0.0
+//   AAAA(28) -> ::
+//   other types -> NODATA (NOERROR, ANCOUNT=0), never forwarded upstream.
+// This prevents IPv6 leaks where a blocked domain would still resolve via AAAA.
+// The reply keeps question + single answer only (NSCOUNT=ARCOUNT=0) so EDNS OPT
+// records from the query are stripped and the reply stays well-formed.
+static const uint16_t QTYPE_A = 1;
+static const uint16_t QTYPE_AAAA = 28;
 static int buildBlocked(int qend, uint16_t qtype) {
-  buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == 1) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
-  if (qtype != 1) return qend;
-  const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
-  memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == QTYPE_A || qtype == QTYPE_AAAA) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
+  if (qtype == QTYPE_A) {
+    const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
+    memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  }
+  if (qtype == QTYPE_AAAA) {
+    const uint8_t ans[] = {0xC0,0x0C, 0,28, 0,1, 0,0,1,0x2C, 0,16, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  }
+  return qend;
 }
 // Forward to upstream and wait for the reply that actually belongs to THIS query.
 // Issue #10: after one timeout the late reply used to sit in the socket and get relayed
