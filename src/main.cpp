@@ -50,7 +50,7 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; uint32_t qWindowMs; uint16_t qCount; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
@@ -217,10 +217,22 @@ static Dev* getClient(uint32_t ip) {
   for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
+    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = ""; c->qWindowMs = 0; c->qCount = 0;
     getMac(ip, c->mac); return c;
   }
   return nullptr;
+}
+
+// Drop floods without replying: 30 queries/sec per client is plenty for a home
+// network and keeps a single misbehaving device from starving the DNS task.
+static const uint16_t DNS_MAX_QPS = 30;
+static bool allowQuery(Dev* c) {
+  if (!c) return true;
+  uint32_t now = millis();
+  if (now - c->qWindowMs >= 1000) { c->qWindowMs = now; c->qCount = 0; }
+  if (c->qCount >= DNS_MAX_QPS) return false;
+  c->qCount++;
+  return true;
 }
 
 // ---------- DNS ----------
@@ -292,12 +304,21 @@ static bool handleDns() {
     int sz = dnsServer.parsePacket(); if (sz <= 0) break;
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 12) continue;
+    // Validate header: must be a standard query with exactly one question.
+    // EDNS OPT records live past qend and are forwarded untouched; blocked
+    // replies strip them (see buildBlocked) to stay well-formed.
+    uint16_t qdcount = (buf[4] << 8) | buf[5];
+    bool isQuery = (buf[2] & 0x80) == 0;
+    uint8_t opcode = (buf[2] >> 3) & 0x0F;
+    if (!isQuery || opcode != 0 || qdcount != 1) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+    if (!dl) continue;  // malformed: drop instead of forwarding upstream
     Dev* c = getClient((uint32_t)cip);
+    if (!allowQuery(c)) continue;  // flood protection: drop without reply
     bool ban = c && c->banned;
-    bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
+    bool blocked = ban || (blockingOn && numHashes && isBlocked(domain));
     int rlen;
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
