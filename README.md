@@ -64,8 +64,24 @@ Build and flash:
 
 ```bash
 pio run -e lilygo-t-display-s3
-pio run -e lilygo-t-display-s3 -t upload
-pio run -e lilygo-t-display-s3 -t uploadfs   # first time: filesystem + blocklist
+pio run -e lilygo-t-display-s3 -t upload   # firmware via USB (first flash)
+```
+
+Initializing the blocklist (pick one; `data/` ships empty so `uploadfs`
+alone does not install a list):
+
+```bash
+# Option A — upload from the dashboard at http://c3adblock.local:
+python3 tools/build_blocklist.py blocklist.bin
+# then Blocklist Upload -> select blocklist.bin (authenticated)
+
+# Option B — let the device pull it over validated HTTPS:
+# paste the weekly release asset into Remote auto-update, e.g.
+# https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin
+
+# Option C — bake it into the filesystem image before flashing it:
+python3 tools/build_blocklist.py data/blocklist.bin
+pio run -e lilygo-t-display-s3 -t uploadfs
 ```
 
 The 16 MB partition table keeps dual OTA app slots (3 MB each) plus ~10 MB
