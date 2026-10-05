@@ -1,0 +1,10 @@
+# 16MB layout for LILYGO T-Display-S3: dual OTA app slots + large LittleFS.
+# App slots are 3MB each (firmware ~1MB with display); LittleFS ~10MB holds
+# ~2M blocklist domains (5 bytes each + 16-byte v1 header) with room for
+# blocklist.new + blocklist.previous during safe updates.
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x5000
+otadata,    data, ota,     0xe000,   0x2000
+app0,       app,  ota_0,   0x10000,  0x300000
+app1,       app,  ota_1,   0x310000, 0x300000
+spiffs,     data, spiffs,  0x610000, 0x9F0000
