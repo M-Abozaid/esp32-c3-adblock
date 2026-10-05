@@ -66,6 +66,20 @@ def test_display_shows_no_secrets():
         assert token not in disp
 
 
+def test_backlight_init_before_display():
+    disp = (ROOT / "src" / "hardware" / "tdisplay_s3" / "display.cpp").read_text()
+    assert "pinMode(GFX_BL, OUTPUT)" in disp
+    assert "digitalWrite(GFX_BL, HIGH)" in disp
+    # Backlight must come up before the panel init so boot is never dark.
+    assert disp.index("digitalWrite(GFX_BL, HIGH)") < disp.index("gfx->begin()")
+
+
+def test_missing_blocklist_is_none_not_error():
+    disp = (ROOT / "src" / "hardware" / "tdisplay_s3" / "display.cpp").read_text()
+    assert '"NONE"' in disp
+    assert '? "READY" : "ERROR"' not in disp
+
+
 def test_ci_builds_s3_target():
     yml = (ROOT / ".github" / "workflows" / "build.yml").read_text()
     assert "lilygo-t-display-s3" in yml

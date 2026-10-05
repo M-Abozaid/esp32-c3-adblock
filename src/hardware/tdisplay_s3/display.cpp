@@ -78,8 +78,10 @@ static void drawStatus(const HwStatus& st) {
   gfx->printf("Queries %u\n", st.blocked + st.allowed);
   gfx->printf("Blocked %u\n", st.blocked);
   gfx->printf("Clients %d\n", st.clients);
-  gfx->setTextColor(st.blocklistReady ? GREEN : RED);
-  gfx->printf("Blocklist %s\n", st.blocklistReady ? "READY" : "ERROR");
+  // Core only reports blocklistReady (numHashes > 0) with no distinct
+  // error signal, so a missing list is NONE, not ERROR.
+  gfx->setTextColor(st.blocklistReady ? GREEN : YELLOW);
+  gfx->printf("Blocklist %s\n", st.blocklistReady ? "READY" : "NONE");
   gfx->setTextColor(WHITE);
   gfx->printf("Uptime %lud %luh %lum\n",
               st.uptimeSec / 86400, (st.uptimeSec % 86400) / 3600, (st.uptimeSec % 3600) / 60);
@@ -113,8 +115,8 @@ static void drawNetwork(const HwStatus& st) {
 
 static void drawBlocklist(const HwStatus& st) {
   title("Blocklist");
-  gfx->setTextColor(st.blocklistReady ? GREEN : RED);
-  gfx->printf("State %s\n", st.blocklistReady ? "READY" : "ERROR");
+  gfx->setTextColor(st.blocklistReady ? GREEN : YELLOW);
+  gfx->printf("State %s\n", st.blocklistReady ? "READY" : "NONE");
   gfx->setTextColor(WHITE);
   gfx->printf("Domains %u\n", st.domains);
   gfx->setTextSize(1);
