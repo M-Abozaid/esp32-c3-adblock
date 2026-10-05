@@ -462,9 +462,36 @@ static void handleStats() {
 // drive-by case without needing TLS, cookies, or a token endpoint.
 static const char* CSRF_HEADER = "X-Requested-With";
 static const char* CSRF_VALUE  = "c3-adblock";
+// Brute-force mitigation (per-IP, expiring; never locks the admin out globally):
+// 5 failures -> 30s lockout, 10+ failures -> 5min lockout for that IP only.
+struct AuthFail { uint32_t ip; uint8_t fails; uint32_t untilMs; };
+static AuthFail authFails[8];
+static bool authLocked(uint32_t ip) {
+  uint32_t now = millis();
+  for (int i = 0; i < 8; i++)
+    if (authFails[i].ip == ip && authFails[i].fails >= 5 && (int32_t)(now - authFails[i].untilMs) < 0)
+      return true;
+  return false;
+}
+static void authNote(uint32_t ip, bool ok) {
+  uint32_t now = millis();
+  int slot = -1;
+  for (int i = 0; i < 8; i++) if (authFails[i].ip == ip) { slot = i; break; }
+  if (ok) { if (slot >= 0) authFails[slot].fails = 0; return; }
+  if (slot < 0) {
+    slot = 0;
+    for (int i = 0; i < 8; i++) if (authFails[i].fails == 0) { slot = i; break; }
+    authFails[slot].ip = ip; authFails[slot].fails = 0;
+  }
+  if (++authFails[slot].fails == 5) authFails[slot].untilMs = now + 30000UL;
+  else if (authFails[slot].fails >= 10) authFails[slot].untilMs = now + 300000UL;
+}
 static bool requireAuth() {
+  uint32_t rip = (uint32_t)web.client().remoteIP();
+  if (authLocked(rip)) { web.send(429, "text/plain", "too many failures, retry later"); return false; }
   if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return false; }
-  if (web.authenticate(WEB_USER, WEB_PASS)) return true;
+  if (web.authenticate(WEB_USER, WEB_PASS)) { authNote(rip, true); return true; }
+  authNote(rip, false);
   web.requestAuthentication();
   return false;
 }
@@ -611,13 +638,16 @@ static void handleUploadDone() {
 static void handleUpload() {
   HTTPUpload& u = web.upload();
   switch (u.status) {
-    case UPLOAD_FILE_START:
-      upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+    case UPLOAD_FILE_START: {
+      uint32_t rip = (uint32_t)web.client().remoteIP();
+      upAuthOk = !authLocked(rip) && web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+      authNote(rip, upAuthOk);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false; beginBlocklistSwap();
       upFile = LittleFS.open("/blocklist.new", "w");
-      Serial.printf("[ota] receiving %s\n", u.filename.c_str());
+      Serial.println("[ota] receiving blocklist upload");
       break;
+    }
     case UPLOAD_FILE_WRITE:
       if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
       break;
@@ -715,9 +745,11 @@ static void handleFwUpdateDone() {
 static void handleFwUpload() {
   HTTPUpload& u = web.upload();
   if (u.status == UPLOAD_FILE_START) {
-    fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+    uint32_t rip = (uint32_t)web.client().remoteIP();
+    fwAuthOk = !authLocked(rip) && web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+    authNote(rip, fwAuthOk);
     if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
-    Serial.printf("[fw-ota] %s\n", u.filename.c_str());
+    Serial.println("[fw-ota] receiving firmware upload");
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_WRITE) {
     if (!fwAuthOk) return;
