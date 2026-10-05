@@ -134,12 +134,12 @@ class PolicyStore:
         d = normalize_domain(domain)
         if b is None or not is_valid_domain(d):
             return False
+        if b not in self.rules and len(self.rules) >= MAX_POLICY_CLIENTS:
+            return False
         lst = self.rules.setdefault(b, [])
         if d in lst:
             return False
         if len(lst) >= MAX_RULES_PER_CLIENT:
-            return False
-        if len(self.rules) > MAX_POLICY_CLIENTS:
             return False
         lst.append(d)
         return True
@@ -297,6 +297,18 @@ def test_banned_preserved():
     assert decide(True, False, False) == "BLOCK"
     assert decide(True, True, True) == "BLOCK"
     assert "bool ban = c && c->banned" in MAIN
+
+
+def test_policy_table_capacity():
+    st = PolicyStore()
+    for i in range(1, MAX_POLICY_CLIENTS + 1):
+        assert st.add_rule("aa:bb:cc:dd:ee:%02x" % i, "tiktok.com") is True
+    assert len(st.rules) == MAX_POLICY_CLIENTS
+    # 33rd distinct client is rejected and leaves the table untouched.
+    assert st.add_rule("aa:bb:cc:dd:ee:00", "tiktok.com") is False
+    assert len(st.rules) == MAX_POLICY_CLIENTS
+    # An already-managed client can still use its own rule budget.
+    assert st.add_rule("aa:bb:cc:dd:ee:01", "instagram.com") is True
 
 
 def test_invalid_domains_rejected():
