@@ -4,8 +4,8 @@
 static const char* WIFI_SSID = "YOUR_WIFI_SSID";
 static const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
-// Auth for the dashboard's state-changing endpoints (/ban, /addblock, /upload,
-// /update, /setupdate, /forgetwifi) and for network OTA (ArduinoOTA). These used
+// Auth for the dashboard's state-changing endpoints (/ban, /addblock, /setalias,
+// /addclientblock, /upload, /update, /setupdate, /forgetwifi) and for network OTA (ArduinoOTA). These used
 // to be wide open to anyone who could reach the device on the LAN — pick real
 // values here, ideally not the same as your WiFi password.
 static const char* WEB_USER = "admin";
