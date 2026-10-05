@@ -243,9 +243,15 @@ static Dev* getClient(uint32_t ip) {
   return nullptr;
 }
 
-// Drop floods without replying: 30 queries/sec per client is plenty for a home
-// network and keeps a single misbehaving device from starving the DNS task.
-static const uint16_t DNS_MAX_QPS = 30;
+// Flood protection policy (documented, tunable at compile time):
+// Home clients burst (browser/DNS prefetch, Android, TVs, consoles), so the
+// limit is a 1-second sliding window, not a hard per-burst cap. Over-limit
+// queries are dropped without a reply: the client times out and retries,
+// while the DNS task stays responsive for everyone else. Increase for very
+// busy networks, decrease for weak upstreams.
+#ifndef DNS_MAX_QPS
+#define DNS_MAX_QPS 50
+#endif
 static bool allowQuery(Dev* c) {
   if (!c) return true;
   uint32_t now = millis();
@@ -349,46 +355,71 @@ static bool handleDns() {
 
 // Minimal TCP DNS for truncated and DNSSEC replies.
 // Modern clients retry over TCP when the UDP TC bit is set or the answer is
-// large. Handle one TCP query per call without blocking the UDP path.
+// large. Stateful and non-blocking: one pending client progresses a little per
+// loop call with an 800ms total budget, so a slow TCP client never stalls UDP
+// DNS, the dashboard or OTA.
+static WiFiClient tcpPending;
+static uint32_t tcpStartMs = 0;
+static uint16_t tcpWant = 0;  // 0 = reading 2-byte length prefix
+static uint8_t tcpLenBuf[2];
+static uint8_t tcpLenGot = 0;
+static size_t tcpGot = 0;
+static const uint32_t TCP_BUDGET_MS = 800;
+static void tcpReset() {
+  if (tcpPending) tcpPending.stop();
+  tcpPending = WiFiClient();
+  tcpWant = 0; tcpLenGot = 0; tcpGot = 0; tcpStartMs = 0;
+}
 static bool handleDnsTcp() {
-  WiFiClient tc = dnsTcp.available();
-  if (!tc) return false;
-  uint32_t t0 = millis();
-  while (tc.connected() && tc.available() < 2 && millis() - t0 < 2000) delay(1);
-  if (tc.available() < 2) { tc.stop(); return true; }
-  uint16_t tlen = (tc.read() << 8) | tc.read();
-  if (tlen < 12 || tlen > sizeof(buf)) { tc.stop(); return true; }
-  size_t got = 0;
-  while (tc.connected() && got < tlen && millis() - t0 < 2000) {
-    int n = tc.read(buf + got, tlen - got);
-    if (n > 0) got += n;
-    else delay(1);
+  if (!tcpPending || !tcpPending.connected()) {
+    if (!dnsTcp.hasClient()) { tcpReset(); return false; }
+    tcpPending = dnsTcp.available();
+    if (!tcpPending) return false;
+    tcpStartMs = millis();
+    tcpWant = 0; tcpLenGot = 0; tcpGot = 0;
   }
+  uint32_t now = millis();
+  if (now - tcpStartMs > TCP_BUDGET_MS) { tcpReset(); return true; }  // drop slow client
+  if (tcpWant == 0) {
+    while (tcpPending.available() && tcpLenGot < 2)
+      tcpLenBuf[tcpLenGot++] = tcpPending.read();
+    if (tcpLenGot < 2) return true;  // wait for more bytes next loop
+    uint16_t tlen = (tcpLenBuf[0] << 8) | tcpLenBuf[1];
+    if (tlen < 12 || tlen > sizeof(buf)) { tcpReset(); return true; }
+    tcpWant = tlen;
+    tcpGot = 0;
+  }
+  while (tcpPending.available() && tcpGot < tcpWant) {
+    int n = tcpPending.read(buf + tcpGot, tcpWant - tcpGot);
+    if (n <= 0) break;
+    tcpGot += n;
+  }
+  if (tcpGot < tcpWant) return true;  // incomplete: continue next loop
   int rlen = 0;
-  if (got == tlen) {
+  {
     uint16_t qdcount = (buf[4] << 8) | buf[5];
     bool isQuery = (buf[2] & 0x80) == 0;
     uint8_t opcode = (buf[2] >> 3) & 0x0F;
-    char domain[256]; uint16_t qtype = 0; int qend = tlen;
+    char domain[256]; uint16_t qtype = 0; int qend = tcpWant;
     size_t dl = 0;
     if (isQuery && opcode == 0 && qdcount == 1)
-      dl = parseQuery(buf, tlen, domain, &qtype, &qend);
+      dl = parseQuery(buf, tcpWant, domain, &qtype, &qend);
     if (dl) {
-      Dev* c = getClient((uint32_t)tc.remoteIP());
+      Dev* c = getClient((uint32_t)tcpPending.remoteIP());
       if (allowQuery(c)) {
         bool ban = c && c->banned;
         bool blocked = ban || (blockingOn && numHashes && isBlocked(domain));
         if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-        else { rlen = forwardUpstream(tlen, qend); totalAllowed++; if (c) c->allowed++; }
+        else { rlen = forwardUpstream(tcpWant, qend); totalAllowed++; if (c) c->allowed++; }
       }
     }
   }
   if (rlen > 0) {
-    tc.write((uint8_t)(rlen >> 8));
-    tc.write((uint8_t)(rlen & 0xFF));
-    tc.write(buf, rlen);
+    tcpPending.write((uint8_t)(rlen >> 8));
+    tcpPending.write((uint8_t)(rlen & 0xFF));
+    tcpPending.write(buf, rlen);
   }
-  tc.stop();
+  tcpReset();
   return true;
 }
 
@@ -444,56 +475,67 @@ static void handleBan() {
 }
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// Atomic update: the live list keeps serving queries while /blocklist.new is
-// written. Only after full validation the live file is replaced. On any
-// failure the previous list stays active, never an empty slot.
+// Safe update with rollback (not a filesystem transaction): the live list keeps
+// serving queries while /blocklist.new is written. Only after full validation
+// the live file is replaced via live -> previous -> new renames. There is a
+// short window with no live file; numHashes is zeroed during the swap so DNS
+// fail-opens instead of reading a closed handle. On boot, a missing live file
+// is recovered from previous/new if valid.
 static bool verifyBlocklistFile(const char* path, uint32_t* outCount, uint32_t* outOffset) {
   File f = LittleFS.open(path, "r");
   if (!f) return false;
   size_t sz = f.size();
-  uint32_t count = 0, offset = 0;
-  bool ok = false;
-  if (sz >= BLOCKLIST_HEADER_SIZE) {
-    uint8_t h[BLOCKLIST_HEADER_SIZE];
-    f.seek(0);
-    if (f.read(h, sizeof(h)) == sizeof(h) &&
-        h[0] == 'C' && h[1] == 'A' && h[2] == 'D' && h[3] == 'B') {
-      uint16_t ver = h[4] | (h[5] << 8);
-      uint8_t hb = h[6];
-      uint32_t cnt = (uint32_t)h[8] | ((uint32_t)h[9] << 8) | ((uint32_t)h[10] << 16) | ((uint32_t)h[11] << 24);
-      uint32_t expectCrc = (uint32_t)h[12] | ((uint32_t)h[13] << 8) | ((uint32_t)h[14] << 16) | ((uint32_t)h[15] << 24);
-      if (ver == BLOCKLIST_VERSION && hb == HASH_BYTES && cnt > 0 &&
-          16 + (size_t)cnt * HASH_BYTES == sz) {
-        uint32_t crc = 0;
-        uint8_t chunk[1024];
-        size_t left = (size_t)cnt * HASH_BYTES;
-        f.seek(16);
-        bool readOk = true;
-        while (left > 0) {
-          size_t n = left > sizeof(chunk) ? sizeof(chunk) : left;
-          size_t got = f.read(chunk, n);
-          if (got != n) { readOk = false; break; }
-          crc = crc32Update(crc, chunk, got);
-          left -= got;
+  if (sz < 4) { f.close(); return false; }
+  uint8_t magic[4];
+  f.seek(0);
+  if (f.read(magic, sizeof(magic)) != sizeof(magic)) { f.close(); return false; }
+  bool hasMagic = magic[0] == 'C' && magic[1] == 'A' && magic[2] == 'D' && magic[3] == 'B';
+  if (hasMagic) {
+    // Versioned file: any header/payload mismatch is a hard reject.
+    // Never fall back to legacy for CADB-prefixed data.
+    bool ok = false;
+    uint32_t count = 0;
+    if (sz >= BLOCKLIST_HEADER_SIZE) {
+      uint8_t h[BLOCKLIST_HEADER_SIZE];
+      f.seek(0);
+      if (f.read(h, sizeof(h)) == sizeof(h)) {
+        uint16_t ver = h[4] | (h[5] << 8);
+        uint8_t hb = h[6];
+        uint32_t cnt = (uint32_t)h[8] | ((uint32_t)h[9] << 8) | ((uint32_t)h[10] << 16) | ((uint32_t)h[11] << 24);
+        uint32_t expectCrc = (uint32_t)h[12] | ((uint32_t)h[13] << 8) | ((uint32_t)h[14] << 16) | ((uint32_t)h[15] << 24);
+        if (ver == BLOCKLIST_VERSION && hb == HASH_BYTES && cnt > 0 &&
+            16 + (size_t)cnt * HASH_BYTES == sz) {
+          uint32_t crc = 0;
+          uint8_t chunk[1024];
+          size_t left = (size_t)cnt * HASH_BYTES;
+          f.seek(16);
+          bool readOk = true;
+          while (left > 0) {
+            size_t n = left > sizeof(chunk) ? sizeof(chunk) : left;
+            size_t got = f.read(chunk, n);
+            if (got != n) { readOk = false; break; }
+            crc = crc32Update(crc, chunk, got);
+            left -= got;
+          }
+          if (readOk && crc == expectCrc) { count = cnt; ok = true; }
         }
-        if (readOk && crc == expectCrc) { count = cnt; offset = 16; ok = true; }
       }
     }
-  }
-  if (!ok) {
-    // Legacy flat file without header.
-    if (sz > 0 && (sz % HASH_BYTES) == 0) {
-      count = sz / HASH_BYTES;
-      offset = 0;
-      ok = true;
+    f.close();
+    if (ok) {
+      if (outCount) *outCount = count;
+      if (outOffset) *outOffset = BLOCKLIST_HEADER_SIZE;
     }
+    return ok;
   }
+  // Legacy flat file without header.
   f.close();
-  if (ok) {
-    if (outCount) *outCount = count;
-    if (outOffset) *outOffset = offset;
+  if (sz > 0 && (sz % HASH_BYTES) == 0) {
+    if (outCount) *outCount = sz / HASH_BYTES;
+    if (outOffset) *outOffset = 0;
+    return true;
   }
-  return ok;
+  return false;
 }
 static void reopenBlocklist() {
   if (blocklist) blocklist.close();
@@ -504,11 +546,24 @@ static void reopenBlocklist() {
     blocklistOffset = offset;
     buildFlashIndex();
     Serial.printf("blocklist: %u domains (%s)\n", numHashes, offset ? "v1 header" : "legacy");
-  } else {
-    numHashes = 0;
-    blocklistOffset = 0;
-    Serial.println("blocklist: missing or invalid");
+    return;
   }
+  // Boot recovery after a crash between renames: prefer previous, then new.
+  if (verifyBlocklistFile("/blocklist.previous", &count, &offset)) {
+    LittleFS.remove(BLOCKLIST_PATH);
+    LittleFS.rename("/blocklist.previous", BLOCKLIST_PATH);
+    reopenBlocklist();
+    return;
+  }
+  if (verifyBlocklistFile("/blocklist.new", &count, &offset)) {
+    LittleFS.remove(BLOCKLIST_PATH);
+    LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
+    reopenBlocklist();
+    return;
+  }
+  numHashes = 0;
+  blocklistOffset = 0;
+  Serial.println("blocklist: missing or invalid");
 }
 static void beginBlocklistSwap() {
   // Keep the live list open and serving; only drop any stale temp file.
@@ -527,8 +582,10 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
     return false;  // live list untouched
   }
   if (blocklist) blocklist.close();
+  numHashes = 0;  // fail-open during the rename window; never read a closed handle
   LittleFS.remove("/blocklist.previous");
   // Keep one rollback copy: live -> previous, new -> live.
+  // Not a true atomic transaction: a crash here is recovered on boot.
   if (LittleFS.exists(BLOCKLIST_PATH))
     LittleFS.rename(BLOCKLIST_PATH, "/blocklist.previous");
   if (!LittleFS.rename("/blocklist.new", BLOCKLIST_PATH)) {

@@ -1,7 +1,13 @@
 #pragma once
-// Root CA bundle for HTTPS blocklist downloads (GitHub release + CDN).
-// Validates TLS instead of using setInsecure(). Covers ISRG Root X1
-// (Let's Encrypt) and DigiCert Global Root CA / G2 (GitHub).
+// TLS trust strategy for HTTPS blocklist downloads (fail closed, old list kept):
+// - Arduino 3.x: useBuiltinCACertBundle() (Mozilla bundle maintained by Espressif).
+// - Arduino 2.x: setCACert(ROOT_CA_BUNDLE) below (ISRG Root X1 + DigiCert
+//   Global Root CA/G2, enough for github.com -> release CDN redirects).
+// Maintenance: if GitHub/CDN rotates to a new root, refresh this bundle from
+// https://curl.se/ca/cacert.pem or the vendor CA pages and reflash. Plain HTTP
+// URLs skip TLS entirely (LAN testing only). CRC32 in the v1 header detects
+// accidental corruption/truncation; it is NOT content authentication — a future
+// step is detached Ed25519 signatures verified on device.
 // If the remote uses another CA, the fetch fails closed and the old list is kept.
 static const char ROOT_CA_BUNDLE[] PROGMEM = R"PEM(-----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
