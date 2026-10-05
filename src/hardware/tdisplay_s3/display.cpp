@@ -25,7 +25,12 @@ static const uint32_t DRAW_INTERVAL_MS = 1500;
 void tdisplayBegin() {
   pinMode(GFX_PWD, OUTPUT);
   digitalWrite(GFX_PWD, HIGH);
+
+  pinMode(GFX_BL, OUTPUT);
+  digitalWrite(GFX_BL, HIGH);
+
   buttonsInit();
+
   gfxBus = new Arduino_ESP32PAR8Q(
       7 /* DC */, 6 /* CS */, 8 /* WR */, 9 /* RD */,
       39 /* D0 */, 40 /* D1 */, 41 /* D2 */, 42 /* D3 */,
