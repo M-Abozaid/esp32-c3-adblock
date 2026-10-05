@@ -48,14 +48,17 @@ def is_valid_domain(d):
     return labels >= 2
 
 
-def is_valid_update_url(u):
+def is_valid_update_url(u, allow_http=False):
     if not (8 <= len(u) <= 200):
         return False
     if any(ord(c) < 0x20 or ord(c) == 0x7F for c in u):
         return False
     if " " in u:
         return False
-    return u.startswith("https://") or u.startswith("http://")
+    if u.startswith("https://"):
+        return True
+    # Plain HTTP needs an explicit -DALLOW_HTTP_BLOCKLIST=1 build.
+    return allow_http and u.startswith("http://")
 
 
 def verify_blocklist(data):
@@ -119,7 +122,8 @@ def test_reject_html_js_control():
 
 def test_update_url_policy():
     assert is_valid_update_url("https://github.com/x/blocklist.bin")
-    assert is_valid_update_url("http://192.168.1.5/list.bin")
+    assert not is_valid_update_url("http://192.168.1.5/list.bin")
+    assert is_valid_update_url("http://192.168.1.5/list.bin", allow_http=True)
     assert not is_valid_update_url("ftp://x/y")
     assert not is_valid_update_url("https://x\r\nHeader: evil")
     assert not is_valid_update_url("x" * 201)
@@ -149,21 +153,11 @@ def test_json_control_chars_escaped():
     assert json.loads('"%s"' % jesc(s)) == s
 
 
-def test_dns_adversarial_vectors():
-    # Parser must reject: QDCOUNT=0/2, non-IN class, label>63, name>255,
-    # compression pointers, circular pointers, truncated question, bad TCP len.
-    bad = [
-        {"qdcount": 0},
-        {"qdcount": 2},
-        {"qclass": 3},
-        {"label_len": 64},
-        {"name_len": 300},
-        {"compressed": True},
-        {"circular": True},
-        {"truncated": True},
-        {"tcp_len": 11},
-        {"tcp_len": 2000},
-    ]
-    for v in bad:
-        assert v  # vectors documented; firmware drops each (parseQuery==0)
-    assert len(bad) == 10
+def test_dns_vectors_covered_by_parser_suite():
+    # Real packet-level vectors live in tests/test_dns_parser.py, which ports
+    # parseQuery() + header checks and constructs binary queries. This guards
+    # against this file silently replacing packet tests with a stub list.
+    import pathlib
+    parser = pathlib.Path(__file__).with_name("test_dns_parser.py").read_text()
+    for token in ("qdcount", "0xc0", "parse_query", "header_ok", "edns", "tcp"):
+        assert token in parser.lower()
