@@ -143,6 +143,7 @@ state-changing endpoint requires **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from
 `secrets.h`):
 
 - `/ban`, `/addblock`, `/unblock`, `/forgetwifi`
+- `/setdnslog` (DNS query logging collector config; only with `ENABLE_QUERY_LOGGING=1`)
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`
 
@@ -197,6 +198,50 @@ your main DNS. Test:
 dig @<c3-ip> doubleclick.net   # -> 0.0.0.0  (blocked)
 dig @<c3-ip> github.com        # -> real IP  (forwarded)
 ```
+
+## DNS Query Logging
+
+Optional, **off by default** (build with `-DENABLE_QUERY_LOGGING=1`). When
+enabled, the device emits a compact binary UDP datagram per DNS decision to
+an external collector on your LAN:
+
+```
+Client → ESP32 → UDP collector
+```
+
+- Dashboard section *DNS Query Logging*: Enable, Collector IP (IPv4, v1),
+  UDP port (default `40153`, `1..65535`), Mode (`OFF` / `BLOCKED_ONLY` / `ALL`).
+  Without Enable the effective mode is `OFF`. Config persists in LittleFS
+  (`/dnslog.cfg`) and is revalidated on boot — invalid config means logging
+  disabled, DNS keeps working.
+- Payload is binary (`34 + domain_length` bytes, max 287, version `1`,
+  event `0x01`), all multi-byte big-endian. Fixed fields: sequence `u32`
+  (wraps, RAM-only), timestamp `u32` (Unix, `0` = NTP not synced yet),
+  device ID 6 B (derived from the ESP32 STA MAC, stable per device),
+  client MAC 6 B (all zeros = unknown, never blocks the query) + IPv4 4 B,
+  QTYPE `u16` (full numeric type, preserved), RCODE `u8` (actually delivered;
+  locally blocked sinkhole/NODATA always `0`; upstream timeout with no reply
+  emits no event — failures are never mislabeled as blocks), latency `u16` ms
+  (saturated at `0xFFFF`), transport `u8` (`0` = UDP; `1` = TCP reserved for
+  the TCP opt-in), flags (`bit0` blocked, `bit1` locally generated),
+  domain length + normalized domain only (max 253 chars).
+  No JSON, no HTTP/TLS, no retries, no persistent queue, no LittleFS history.
+- Fire-and-forget: the DNS reply goes out first, latency stops there, and
+  telemetry is queued in a small RAM queue (32 events, full → drop) drained
+  best-effort from `loop()`. Collector time is never inside `latency_ms`.
+  Collector offline/unknown/port closed → event silently dropped; DNS is
+  never delayed, retried, or marked unhealthy.
+- One event per query max, emitted after the ban → block → forward decision
+  (malformed queries and upstream timeouts emit nothing).
+- Counters (`generated` / `dispatched` / `dropped`) and *Last event
+  dispatched* are RAM-only diagnostics in `/stats.json`. "Dispatched" means
+  handed to UDP — delivery is not guaranteed.
+- Security: the channel is unauthenticated LAN telemetry. The ESP32 never
+  interprets inbound UDP as commands (send-only socket), and no passwords,
+  cookies, configs, or request contents ever leave the device.
+
+The collector (UDP receiver → database → API → UI) is a separate project and
+is intentionally **not** part of this firmware.
 
 ## Gotchas (learned the hard way)
 

@@ -3,6 +3,17 @@
 // Dashboard at http://c3adblock.local : per-client stats, system info,
 // ban clients, add custom block domains. All control state persisted to flash.
 
+// ---- DNS query logging (opt-in) ----
+// Build with -DENABLE_QUERY_LOGGING=1 to emit fire-and-forget binary UDP
+// telemetry of DNS decisions to a collector. Default OFF: the event queue
+// and all logging code compile out, so builds reserve zero RAM for it.
+#ifndef ENABLE_QUERY_LOGGING
+#define ENABLE_QUERY_LOGGING 0
+#endif
+#if ENABLE_QUERY_LOGGING
+#include <time.h>  // event timestamps (0 = clock not synced yet)
+#endif
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -38,6 +49,9 @@ static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up
 
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
+#if ENABLE_QUERY_LOGGING
+WiFiUDP dnsLogUdp;
+#endif
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
@@ -206,6 +220,237 @@ static void saveBanned() {
   f.close();
 }
 
+#if ENABLE_QUERY_LOGGING
+// ---------- DNS query logging via UDP collector (opt-in telemetry) ----------
+// Principles: DNS never depends on the collector. Disabled by default.
+// Fire-and-forget binary UDP, best-effort, no retry, no persistent queue,
+// no LittleFS history, no database. Loss is acceptable. The collector is a
+// separate project; the ESP32 only decides and emits.
+//
+// Wire format v1 (big-endian multi-byte, total 34 + domain_length, max 287):
+//   Offset Size  Field
+//   0      1     Protocol version (1)
+//   1      1     Event type (0x01 = DNS_QUERY)
+//   2      4     Sequence number (uint32, wraps, RAM only, never persisted)
+//   6      4     Timestamp unix (0 = clock not synced yet, never blocks DNS)
+//   10     6     Device ID (logical Lily identity for v1; derived from
+//                the ESP32 STA MAC and stable for the lifetime of the
+//                device. Lets one collector serve many Lilys; not a
+//                hostname, decoupled from any future logical naming.)
+//   16     6     Client MAC (primary identity, survives DHCP changes;
+//                all zeros = unknown, never blocks the query)
+//   22     4     Client IPv4 (complementary, dotted order; the address
+//                observed at that moment, not the identity)
+//   26     2     QTYPE (full numeric DNS type, e.g. 1 = A, 28 = AAAA,
+//                15 = MX; preserved, never coerced to A/AAAA)
+//   28     1     RCODE actually delivered to the client: v1 records the
+//                4-bit DNS header RCODE; extended EDNS RCODE is not
+//                represented. Values: 0 NOERROR, 1 FORMERR, 2 SERVFAIL,
+//                3 NXDOMAIN, 5 REFUSED.
+//                Locally blocked sinkhole/NODATA replies always carry 0.
+//                Upstream failures with no reply emit no event (never
+//                invent a code, never mislabel a failure as blocked).
+//   29     2     Latency ms (query-received -> response-ready/sent,
+//                saturated at 0xFFFF; collector UDP time never included)
+//   31     1     Transport of the original DNS query (0 = UDP, 1 = TCP;
+//                not the telemetry transport)
+//   32     1     Flags (bit0 = blocked, bit1 = response generated locally;
+//                blocked lives here, not as a separate field)
+//   33     1     Domain length N (1..253)
+//   34     N     Domain (normalized DNS name only, never URL/HTTPS content)
+// No credentials, cookies, configs or commands ever travel this channel,
+// and inbound UDP on the logging socket is never interpreted.
+static const uint8_t DNSLOG_VERSION = 1;
+static const uint8_t DNSLOG_EVENT_DNS_QUERY = 0x01;
+static const size_t DNSLOG_MAX_DOMAIN = 253;
+static const size_t DNSLOG_PKT_HEAD = 34;
+static const size_t DNSLOG_MAX_PKT = 34 + 253;  // 287
+static const int DNSLOG_QUEUE_CAP = 32;         // small RAM queue; full -> drop
+static const uint16_t DNSLOG_DEFAULT_PORT = 40153;
+static const size_t DNSLOG_MAX_HOST_LEN = 64;   // v1: IPv4 dotted string only
+static const char* DNSLOG_CFG_PATH = "/dnslog.cfg";
+static const uint8_t DNSLOG_TRANSPORT_UDP = 0;
+static const uint8_t DNSLOG_TRANSPORT_TCP = 1;
+static const uint16_t DNSLOG_LATENCY_MAX = 0xFFFF;  // saturation, not a timeout
+// Mode: 0 = OFF, 1 = BLOCKED_ONLY, 2 = ALL. Without Enable the effective
+// mode is OFF (see dnsLoggingActive()).
+static bool dnslogEnabled = false;
+static char dnslogHost[65] = "";
+static uint16_t dnslogPort = DNSLOG_DEFAULT_PORT;
+static uint8_t dnslogMode = 0;
+static IPAddress dnslogIP;
+static bool dnslogHaveIP = false;
+static uint32_t dnsLogSequence = 0;   // wraps; RAM only, never persisted
+static uint32_t dnsLogGenerated = 0, dnsLogDispatched = 0, dnsLogDropped = 0;
+static uint32_t dnsLogLastUnix = 0;   // unix time of last dispatched event (0 = none)
+static uint8_t dnsDeviceId[6] = {0, 0, 0, 0, 0, 0};  // STA MAC, captured once at setup
+struct DnsLogSlot { uint8_t pkt[34 + 253]; uint16_t len; uint32_t unix; };
+static DnsLogSlot dnsLogQueue[DNSLOG_QUEUE_CAP];
+static int dnsLogHead = 0, dnsLogTail = 0, dnsLogCount = 0;
+static const char* dnsLogModeStr() { return dnslogMode == 1 ? "BLOCKED_ONLY" : dnslogMode == 2 ? "ALL" : "OFF"; }
+// v1 accepts IPv4 only: no per-query DNS resolution of the collector name,
+// the cached address is resolved once at load/save time and reused.
+static bool dnsLogHostValid(const String& h) {
+  if (h.length() == 0 || h.length() > DNSLOG_MAX_HOST_LEN) return false;
+  for (size_t i = 0; i < h.length(); i++) {
+    char c = h[i];
+    if (c < 0x20 || c == 0x7F || c == ' ') return false;
+  }
+  IPAddress ip;
+  return ip.fromString(h);
+}
+// Latency is measured strictly as query-received -> response-ready/sent.
+// The enqueue below and the UDP send in dnsLogPump() happen after the
+// measurement, so collector time can never inflate latency_ms. Saturates
+// instead of overflowing; never adds artificial delay to DNS.
+static uint16_t dnsLogLatency(uint32_t t0ms, uint32_t t1ms) {
+  uint32_t d = t1ms - t0ms;  // millis() wrap-safe unsigned difference
+  return d > DNSLOG_LATENCY_MAX ? DNSLOG_LATENCY_MAX : (uint16_t)d;
+}
+static uint32_t dnsLogNowUnix() {
+  time_t t = time(nullptr);
+  if (t < (time_t)1704067200 || t < 0) return 0;  // clock not synced: mark invalid, never block DNS on NTP
+  return (uint32_t)t;
+}
+static bool dnsLoggingActive() { return dnslogEnabled && dnslogMode != 0 && dnslogHaveIP && dnslogPort != 0; }
+static bool dnsLogShouldSend(bool blocked) {
+  if (!dnsLoggingActive()) return false;
+  if (dnslogMode == 1) return blocked;   // BLOCKED_ONLY
+  if (dnslogMode == 2) return true;      // ALL
+  return false;
+}
+// Encodes one event into out; returns total length or 0 when the domain is
+// out of bounds or the buffer is too small. Never reads past domain[domainLen].
+static size_t dnsLogEncode(uint8_t* out, size_t outCap, uint32_t seq, uint32_t nowUnix,
+                           const uint8_t* deviceId, const uint8_t* mac, IPAddress cip,
+                           uint16_t qtype, uint8_t rcode, uint16_t latencyMs,
+                           uint8_t transport, bool blocked,
+                           const char* domain, size_t domainLen) {
+  if (!out || !domain || domainLen == 0 || domainLen > DNSLOG_MAX_DOMAIN) return 0;
+  if (outCap < DNSLOG_PKT_HEAD + domainLen) return 0;
+  if (transport != DNSLOG_TRANSPORT_UDP && transport != DNSLOG_TRANSPORT_TCP) return 0;
+  out[0] = DNSLOG_VERSION;
+  out[1] = DNSLOG_EVENT_DNS_QUERY;
+  out[2] = (uint8_t)(seq >> 24); out[3] = (uint8_t)(seq >> 16);
+  out[4] = (uint8_t)(seq >> 8);  out[5] = (uint8_t)seq;
+  out[6] = (uint8_t)(nowUnix >> 24); out[7] = (uint8_t)(nowUnix >> 16);
+  out[8] = (uint8_t)(nowUnix >> 8);  out[9] = (uint8_t)nowUnix;
+  if (deviceId) memcpy(out + 10, deviceId, 6); else memset(out + 10, 0, 6);
+  if (mac) memcpy(out + 16, mac, 6); else memset(out + 16, 0, 6);
+  out[22] = cip[0]; out[23] = cip[1]; out[24] = cip[2]; out[25] = cip[3];
+  out[26] = (uint8_t)(qtype >> 8); out[27] = (uint8_t)qtype;
+  out[28] = (uint8_t)(rcode & 0x0F);
+  out[29] = (uint8_t)(latencyMs >> 8); out[30] = (uint8_t)latencyMs;
+  out[31] = transport;
+  out[32] = (uint8_t)((blocked ? 0x01 : 0x00) | (blocked ? 0x02 : 0x00));  // bit0 blocked, bit1 locally generated (sinkhole)
+  out[33] = (uint8_t)domainLen;
+  memcpy(out + 34, domain, domainLen);
+  return DNSLOG_PKT_HEAD + domainLen;
+}
+static void dnsLogResolve() {
+  IPAddress ip;
+  if (dnslogHost[0] && ip.fromString(String(dnslogHost))) { dnslogIP = ip; dnslogHaveIP = true; }
+  else dnslogHaveIP = false;
+}
+// Enqueue only; the actual UDP send happens in dnsLogPump() from loop() so
+// the DNS path never blocks on the network. Queue full -> drop the event.
+// rcode/latency/transport must come from the already-finished DNS exchange:
+// callers pass the code actually delivered, the measured processing time,
+// and the transport the query arrived on. No reply (rlen == 0) -> caller
+// skips the emit; this function never invents a result.
+static void dnsLogEmit(const uint8_t* mac, IPAddress cip, const char* domain,
+                       uint16_t qtype, bool blocked, uint8_t rcode,
+                       uint16_t latencyMs, uint8_t transport) {
+  if (!dnsLogShouldSend(blocked)) return;
+  if (!domain) return;
+  size_t dlen = strlen(domain);
+  dnsLogGenerated++;
+  if (dlen == 0 || dlen > DNSLOG_MAX_DOMAIN) { dnsLogDropped++; return; }  // oversized: discard locally
+  uint8_t tmp[34 + 253];
+  uint8_t m[6] = {0, 0, 0, 0, 0, 0};
+  if (mac) memcpy(m, mac, 6);
+  uint32_t nowUnix = dnsLogNowUnix();
+  size_t plen = dnsLogEncode(tmp, sizeof(tmp), dnsLogSequence + 1, nowUnix,
+                             dnsDeviceId, m, cip, qtype, rcode, latencyMs,
+                             transport, blocked, domain, dlen);
+  if (!plen) { dnsLogDropped++; return; }
+  dnsLogSequence++;  // consume a sequence number only for a well-formed event
+  if (dnsLogCount >= DNSLOG_QUEUE_CAP) { dnsLogDropped++; return; }
+  DnsLogSlot* s = &dnsLogQueue[dnsLogTail];
+  memcpy(s->pkt, tmp, plen);
+  s->len = (uint16_t)plen;
+  s->unix = nowUnix;
+  dnsLogTail = (dnsLogTail + 1) % DNSLOG_QUEUE_CAP;
+  dnsLogCount++;
+}
+// Best-effort drain: a few datagrams per loop call so TCP/DNS/dashboard/OTA
+// keep their turn. Any send failure is a silent drop — never a retry, never
+// a DNS error, never persisted.
+static void dnsLogPump() {
+  for (int budget = 0; budget < 8 && dnsLogCount > 0; budget++) {
+    DnsLogSlot* s = &dnsLogQueue[dnsLogHead];
+    uint16_t len = s->len;
+    uint32_t unix = s->unix;
+    uint8_t pkt[34 + 253];
+    if (len > sizeof(pkt)) { dnsLogDropped++; }
+    else {
+      memcpy(pkt, s->pkt, len);
+      dnsLogHead = (dnsLogHead + 1) % DNSLOG_QUEUE_CAP;
+      dnsLogCount--;
+      bool ok = false;
+      if (dnslogHaveIP && dnslogPort != 0) {
+        dnsLogUdp.beginPacket(dnslogIP, dnslogPort);
+        dnsLogUdp.write(pkt, len);
+        ok = dnsLogUdp.endPacket() != 0;
+      }
+      if (ok) { dnsLogDispatched++; dnsLogLastUnix = unix; }
+      else dnsLogDropped++;
+      continue;
+    }
+    dnsLogHead = (dnsLogHead + 1) % DNSLOG_QUEUE_CAP;
+    dnsLogCount--;
+  }
+}
+static void saveDnsLog() {
+  File f = LittleFS.open(DNSLOG_CFG_PATH, "w"); if (!f) return;
+  f.println(dnslogEnabled ? "1" : "0");
+  f.println(dnslogHost);
+  f.println(dnslogPort);
+  f.println(dnsLogModeStr());
+  f.close();
+}
+// Invalid persisted config -> logging disabled, firmware continues normally.
+static void loadDnsLog() {
+  dnslogEnabled = false; dnslogHost[0] = 0; dnslogPort = DNSLOG_DEFAULT_PORT;
+  dnslogMode = 0; dnslogHaveIP = false;
+  File f = LittleFS.open(DNSLOG_CFG_PATH, "r"); if (!f) return;
+  String en = f.readStringUntil('\n'); en.trim();
+  String host = f.readStringUntil('\n'); host.trim();
+  String portS = f.readStringUntil('\n'); portS.trim();
+  String modeS = f.readStringUntil('\n'); modeS.trim(); modeS.toUpperCase();
+  f.close();
+  if (en != "0" && en != "1") return;  // corrupt: stay disabled
+  long port = portS.toInt();
+  if (port < 1 || port > 65535) return;  // corrupt: stay disabled
+  uint8_t mode = 0;
+  if (modeS == "OFF" || modeS == "0") mode = 0;
+  else if (modeS == "BLOCKED_ONLY" || modeS == "1") mode = 1;
+  else if (modeS == "ALL" || modeS == "2") mode = 2;
+  else return;  // unknown enum: stay disabled
+  if (host.length() > DNSLOG_MAX_HOST_LEN) return;
+  if (host.length() && !dnsLogHostValid(host)) return;  // bad host: stay disabled
+  if (en == "1" && mode != 0 && host.length() == 0) return;  // enabled needs a host
+  dnslogEnabled = (en == "1");
+  if (host.length()) { strncpy(dnslogHost, host.c_str(), sizeof(dnslogHost) - 1); dnslogHost[sizeof(dnslogHost) - 1] = 0; }
+  dnslogPort = (uint16_t)port;
+  dnslogMode = mode;
+  dnsLogResolve();
+  // Note: the host string is kept for display even when inactive;
+  // dnsLoggingActive() gates every send, so an invalid/disabled config
+  // can never emit.
+}
+#endif  // ENABLE_QUERY_LOGGING
+
 // ---------- client table ----------
 static void getMac(uint32_t ip, uint8_t* mac) {
   memset(mac, 0, 6); ip4_addr_t ipa; ipa.addr = ip;
@@ -278,15 +523,32 @@ static bool handleDns() {
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
     int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+#if ENABLE_QUERY_LOGGING
+    uint32_t qMs = millis();  // latency start: query received off the wire
+#endif
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
     Dev* c = getClient((uint32_t)cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
     int rlen;
+#if ENABLE_QUERY_LOGGING
+    uint8_t rcode = 0;
+    if (blocked) { rlen = buildBlocked(qend, qtype); rcode = 0; totalBlocked++; if (c) c->blocked++; }  // sinkhole/NODATA replies always carry NOERROR
+    else         { rlen = forwardUpstream(qlen, qend); if (rlen >= 12) rcode = buf[3] & 0x0F; totalAllowed++; if (c) c->allowed++; }
+#else
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
+#endif
     if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+#if ENABLE_QUERY_LOGGING
+    // Telemetry last: reply already on the wire, latency stops here, the
+    // collector UDP send happens later in dnsLogPump(). Upstream timeout
+    // (rlen == 0, nothing delivered) emits nothing — never invent a code.
+    if (rlen > 0)
+      dnsLogEmit(c ? c->mac : nullptr, cip, domain, qtype, blocked, rcode,
+                 dnsLogLatency(qMs, millis()), DNSLOG_TRANSPORT_UDP);
+#endif
   }
   return did;
 }
@@ -332,6 +594,18 @@ static void handleStats() {
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
+#if ENABLE_QUERY_LOGGING
+  j += "],\"dnslog\":{\"enabled\":" + String(dnslogEnabled ? "true" : "false") +
+       ",\"mode\":\"" + dnsLogModeStr() + "\"" +
+       ",\"device\":\"" + macStr(dnsDeviceId) + "\"" +
+       ",\"host\":\"" + jesc(String(dnslogHost)) + "\"" +
+       ",\"port\":" + dnslogPort +
+       ",\"active\":" + (dnsLoggingActive() ? "true" : "false") +
+       ",\"generated\":" + dnsLogGenerated +
+       ",\"dispatched\":" + dnsLogDispatched +
+       ",\"dropped\":" + dnsLogDropped +
+       ",\"last\":" + dnsLogLastUnix + "}";
+#endif
   j += "]}";
   web.send(200, "application/json", j);
 }
@@ -361,6 +635,49 @@ static void handleBan() {
   IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
   web.send(200, "text/plain", "ok");
 }
+#if ENABLE_QUERY_LOGGING
+// DNS logging config endpoint. Same auth model as /ban and /addblock.
+// Args: enabled=0/1, host=<ipv4>, port=1..65535, mode=OFF|BLOCKED_ONLY|ALL.
+// v1 accepts IPv4 only so no collector DNS lookup ever happens on the device.
+static void handleSetDnsLog() {
+  if (!requireAuth()) return;
+  bool newEnabled = dnslogEnabled;
+  String newHost = String(dnslogHost);
+  long newPort = dnslogPort;
+  uint8_t newMode = dnslogMode;
+  if (web.hasArg("enabled")) {
+    String e = web.arg("enabled"); e.trim(); e.toLowerCase();
+    if (e == "1" || e == "true" || e == "on") newEnabled = true;
+    else if (e == "0" || e == "false" || e == "off") newEnabled = false;
+    else { web.send(400, "text/plain", "invalid enabled (0/1)"); return; }
+  }
+  if (web.hasArg("host")) {
+    newHost = web.arg("host"); newHost.trim();
+    if (newHost.length() > (int)DNSLOG_MAX_HOST_LEN) { web.send(400, "text/plain", "invalid host (max 64 chars, IPv4)"); return; }
+    if (newHost.length() && !dnsLogHostValid(newHost)) { web.send(400, "text/plain", "invalid host (IPv4 required)"); return; }
+  }
+  if (web.hasArg("port")) {
+    newPort = web.arg("port").toInt();
+    if (newPort < 1 || newPort > 65535) { web.send(400, "text/plain", "invalid port (1..65535)"); return; }
+  }
+  if (web.hasArg("mode")) {
+    String m = web.arg("mode"); m.trim(); m.toUpperCase();
+    if (m == "OFF" || m == "0") newMode = 0;
+    else if (m == "BLOCKED_ONLY" || m == "1") newMode = 1;
+    else if (m == "ALL" || m == "2") newMode = 2;
+    else { web.send(400, "text/plain", "invalid mode (OFF/BLOCKED_ONLY/ALL)"); return; }
+  }
+  if (newEnabled && newMode != 0 && newHost.length() == 0) { web.send(400, "text/plain", "host required when enabled"); return; }
+  dnslogEnabled = newEnabled;
+  memset(dnslogHost, 0, sizeof(dnslogHost));
+  if (newHost.length()) { strncpy(dnslogHost, newHost.c_str(), sizeof(dnslogHost) - 1); }
+  dnslogPort = (uint16_t)newPort;
+  dnslogMode = newMode;
+  dnsLogResolve();
+  saveDnsLog();
+  web.send(200, "text/plain", "ok");
+}
+#endif  // ENABLE_QUERY_LOGGING
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
 // The partition holds one list, so we free the old one before writing the new.
@@ -576,6 +893,9 @@ void setup() {
     buildFlashIndex();
   }
   loadCustom(); loadBanned(); loadUpdateCfg();
+#if ENABLE_QUERY_LOGGING
+  loadDnsLog();
+#endif
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -591,6 +911,9 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
+#if ENABLE_QUERY_LOGGING
+  WiFi.macAddress(dnsDeviceId);  // stable per-device telemetry identity (not a hostname, no config needed)
+#endif
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
   if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
@@ -599,10 +922,16 @@ void setup() {
                     "device on a network you don't fully control.");
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+#if ENABLE_QUERY_LOGGING
+  dnsLogUdp.begin(0);
+#endif
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
+#if ENABLE_QUERY_LOGGING
+  web.on("/setdnslog", handleSetDnsLog);
+#endif
   web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
@@ -634,6 +963,9 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
+#if ENABLE_QUERY_LOGGING
+  dnsLogPump();  // fire-and-forget drain; never blocks DNS, never retries
+#endif
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
