@@ -41,6 +41,10 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <h2>FIRMWARE &mdash; OTA UPDATE</h2>
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
+<h2>UPSTREAM DNS &mdash; FORWARDER</h2>
+<div style=margin-bottom:6px><input id=dnsip placeholder="9.9.9.9" size=18>
+<button onclick=saveDns()>Save</button> <button onclick=useGwDns()>Use gateway</button> <span id=dnsmsg style=color:#8b949e></span></div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">where allowed lookups are forwarded &mdash; the resolver your router hands out unless you set something else</div>
 <h2>WIFI</h2>
 <div style=margin-bottom:18px><button onclick="if(confirm('Forget saved WiFi and reboot into the setup portal?'))forgetWifi()">Forget WiFi</button></div>
 </div><script>
@@ -69,6 +73,8 @@ ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a
 cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
+if(document.activeElement!=dnsip)dnsip.value=s.dns||'';
+dnsmsg.textContent=s.dnsCustom?'set on device':('from '+s.dnsSource);
 ustat.textContent=s.upstat||'—';}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{dom.value='';load()})}}
 ct.addEventListener('click',e=>{if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
@@ -76,6 +82,8 @@ cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/
 function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:CSRF_HDRS}).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
 function forgetWifi(){fetch('/forgetwifi',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>alert(t))}
+function saveDns(){let v=dnsip.value.trim();if(!v)return;fetch('/setdns?ip='+encodeURIComponent(v),{headers:CSRF_HDRS}).then(async r=>{if(!r.ok)alert('✗ '+await r.text());load()})}
+function useGwDns(){fetch('/setdns?gw=1',{headers:CSRF_HDRS}).then(load)}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
 try{let r=await fetch('/update',{method:'POST',headers:CSRF_HDRS,body:fd});fwmsg.textContent=r.ok?'✓ rebooting, reconnect in ~15s':'✗ '+await r.text();}
