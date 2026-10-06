@@ -17,7 +17,8 @@ class BuildBlocklistTests(unittest.TestCase):
                               '127.0.0.1 metrics.example.com\n', encoding='utf-8')
 
             subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('build_blocklist.py')),
-                            str(output), str(source)], check=True, capture_output=True, text=True)
+                            '--format', 'raw', str(output), str(source)],
+                           check=True, capture_output=True, text=True)
 
             data = output.read_bytes()
             hashes = {int.from_bytes(data[i:i + HASH_BYTES], 'little')

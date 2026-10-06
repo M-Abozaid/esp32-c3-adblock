@@ -10,6 +10,12 @@ The trick everyone misses: you don't need to keep the blocklist in RAM. Store th
 domains as **sorted 40-bit hashes in flash** and binary-search them. 140,000+ domains
 fit in ~0.7 MB of flash and are matched in ~10 ms, using **~50 KB of RAM**.
 
+The file is a small versioned container: a 16-byte header (magic `C3BL`, format
+version, hash width, entry count, CRC32) followed by the sorted hashes. The firmware
+rejects any file without a valid header and CRC, so a random blob never loads. A file
+in the old raw format still loads in read-only mode, so an upgrade does not drop the
+list. See [`docs/blocklist-format.md`](docs/blocklist-format.md).
+
 ```
 query in ──▶ extract domain ──▶ FNV-1a hash (+ parent suffixes)
          ──▶ binary-search the flash hash table
@@ -108,6 +114,16 @@ un-blocks that exact entry — it can't carve a subdomain out of a blocked paren
 can't be downloaded the build stops instead of silently producing a smaller list
 (`--allow-missing` to override).
 
+The output is a versioned container (16-byte header + payload). The firmware validates the
+header and the payload CRC32 before it loads the list, so a random file is rejected. The
+format is documented in [`docs/blocklist-format.md`](docs/blocklist-format.md). For firmware
+that predates the container, build the legacy headerless form with `--format raw`.
+
+After a firmware upgrade that adds the container, an on-device raw `blocklist.bin` still
+loads in read-only mode (with a boot warning). The firmware changes the exact official
+legacy release URL to `blocklist-v1.bin` and saves it in `/update.cfg`. Custom URLs stay
+as configured. Upload a v1 file or set a v1 URL to update a device with a custom URL.
+
 ### WiFi setup (no re-flash needed)
 
 If it can't connect (or you never set `secrets.h`), it starts an open access point
@@ -121,10 +137,13 @@ just visit — see Security below.)
 
 The dashboard at **http://c3adblock.local** does it all:
 
-- **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
-  URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
-  on a schedule. A fresh default list is rebuilt **every Monday** by GitHub Actions and
-  published at a stable URL, so pasting this once keeps a device current on its own:
+- **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload* (uploads
+  must be the v1 container), or set a URL under *Remote auto-update* and the device pulls a
+  prebuilt file on a schedule. A fresh default list is rebuilt **every Monday** by GitHub
+  Actions and published at a stable URL, so pasting this once keeps a device current on its
+  own. Current firmware uses the v1 container:
+  `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist-v1.bin`
+  Older firmware keeps working on the legacy raw artifact:
   `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin`
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
   device verifies it and reboots into the new image. Or push over WiFi from the CLI:
@@ -132,9 +151,11 @@ The dashboard at **http://c3adblock.local** does it all:
   pio run -t upload --upload-port c3adblock.local --upload-protocol espota
   ```
 
-**4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
-blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
-single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
+**4 MB flash tradeoff:** firmware OTA needs two app slots. This leaves about 1.31 MB
+for LittleFS. A safe blocklist update holds the live file and `/blocklist.new` at once.
+The weekly release limits each v1 file to less than 600,000 bytes (about 120,000 hashes).
+This leaves room for filesystem metadata and configuration. The aggressive 537k
+"ultimate" list only fits the single-app partition table. See `partitions.csv`.
 
 ## Security
 

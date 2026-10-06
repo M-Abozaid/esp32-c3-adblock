@@ -1,8 +1,7 @@
 name: blocklist
 
-# Rebuilds the default blocklist weekly and publishes it at a stable URL:
-#   https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin
-# Point a device's "Remote auto-update" at that URL and it stays current on its own.
+# Rebuild the default blocklist weekly. Current firmware uses blocklist-v1.bin.
+# Older firmware uses the legacy blocklist.bin from the same release.
 on:
   schedule:
     - cron: "17 4 * * 1"   # Mondays 04:17 UTC
@@ -20,26 +19,42 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build default blocklist (fails if any source is unreachable)
-        run: python3 tools/build_blocklist.py blocklist.bin 2>&1 | tee build.log
+        run: |
+          python3 tools/build_blocklist.py --format v1 blocklist-v1.bin 2>&1 | tee build.log
+          tail -c +17 blocklist-v1.bin > blocklist.bin   # legacy raw = same snapshot's payload
       - name: Sanity checks
         run: |
-          size=$(stat -c%s blocklist.bin)
-          echo "size=$size bytes"
-          test $((size % 5)) -eq 0                  # whole 40-bit entries
-          test "$size" -gt 250000                   # >50k entries, catches a silently shrunk list
-          test "$size" -lt 1300000                  # fits the dual-OTA filesystem partition
+          size1=$(stat -c%s blocklist-v1.bin); sizer=$(stat -c%s blocklist.bin)
+          echo "v1=$size1 bytes  raw=$sizer bytes"
+          test "$(head -c4 blocklist-v1.bin)" = "C3BL"   # versioned container magic
+          test "$size1" -gt 250016                        # >50k entries + 16-byte header
+          test "$size1" -lt 600000                        # leave room for live and staging files
+          test "$sizer" -eq $((size1 - 16))               # raw payload == container payload
+          python3 - <<'PY'
+          import struct, zlib
+          d = open('blocklist-v1.bin', 'rb').read()
+          ver, hb, resv, count, crc = struct.unpack('<BBHII', d[4:16])
+          assert (ver, hb, resv) == (1, 5, 0), (ver, hb, resv)
+          assert len(d) == 16 + count * hb, 'size mismatch'
+          assert zlib.crc32(d[16:]) & 0xffffffff == crc, 'CRC mismatch'
+          assert open('blocklist.bin', 'rb').read() == d[16:], 'raw payload differs from container payload'
+          print(f'{count:,} entries; container CRC OK; raw == payload')
+          PY
       - name: Publish to the 'blocklist' release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          entries=$(( $(stat -c%s blocklist.bin) / 5 ))
+          entries=$(( ($(stat -c%s blocklist-v1.bin) - 16) / 5 ))
           notes="Auto-built $(date -u +%F) — ${entries} entries (StevenBlack base + Hagezi Light).
 
-          Set this as the device's Remote auto-update URL:
+          New firmware (v1 container):
+          https://github.com/${{ github.repository }}/releases/download/blocklist/blocklist-v1.bin
+
+          Older firmware (legacy raw, kept for compatibility):
           https://github.com/${{ github.repository }}/releases/download/blocklist/blocklist.bin"
           if gh release view blocklist >/dev/null 2>&1; then
             gh release edit blocklist --notes "$notes"
           else
             gh release create blocklist --title "Weekly blocklist" --notes "$notes" --latest=false
           fi
-          gh release upload blocklist blocklist.bin --clobber
+          gh release upload blocklist blocklist-v1.bin blocklist.bin --clobber

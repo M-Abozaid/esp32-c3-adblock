@@ -30,16 +30,36 @@
 static const IPAddress UPSTREAM(UPSTREAM_IP);
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
+static const char* BLOCKLIST_NEW  = "/blocklist.new";   // pending list, verified before promote
+static const char* BLOCKLIST_OLD  = "/blocklist.old";   // previous list kept during a crash-safe swap
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 static const int INDEX_ENTRIES = 4096;   // 20 KB first-level flash index
 static const int CACHE_SIZE = 256;       // must be power of 2
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
 
+// Blocklist container (see tools/build_blocklist.py and docs/blocklist-format.md).
+// The payload is unchanged (sorted HASH_BYTES hashes), but a fixed header now
+// carries a version and a CRC32 so the firmware can reject a random blob and the
+// format can change later without mixing old and new .bin files.
+//   offset size field
+//   0      4    magic 'C3BL'
+//   4      1    format version
+//   5      1    hash bytes (must equal HASH_BYTES)
+//   6      2    reserved (0)
+//   8      4    entry count (LE)
+//   12     4    CRC32 of the payload (LE)
+//   16     n*HB payload
+static const uint8_t  BL_MAGIC[4]     = {'C', '3', 'B', 'L'};
+static const uint8_t  BL_VERSION      = 1;
+static const uint32_t BL_HEADER_SIZE  = 16;
+
+
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
 File blocklist;
+uint32_t blocklistOffset = 0;   // first payload byte in the file (BL_HEADER_SIZE once validated)
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
 uint8_t buf[1536];   // fits any non-fragmented UDP reply (EDNS answers can exceed 512)
 
@@ -61,7 +81,9 @@ static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
 
 // remote blocklist auto-update
-String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
+static const char* OFFICIAL_RAW_URL = "https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin";
+static const char* OFFICIAL_V1_URL = "https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist-v1.bin";
+String updateUrl = "";              // URL of a prebuilt v1 blocklist
 uint32_t updateIntervalH = 24;      // hours between auto-fetches
 uint32_t lastCheckMs = 0;
 String updateStatus = "never";
@@ -94,7 +116,7 @@ static void buildFlashIndex() {
   if (!blocklist || numHashes == 0) return;
   for (int i = 0; i < INDEX_ENTRIES; i++) {
     uint32_t pos = (uint32_t)((uint64_t)i * (numHashes - 1) / (INDEX_ENTRIES - 1));
-    blocklist.seek((uint32_t)pos * HASH_BYTES);
+    blocklist.seek(blocklistOffset + (uint32_t)pos * HASH_BYTES);
     blocklist.read(blIndex[i], HASH_BYTES);
   }
   for (int i = 0; i < CACHE_SIZE; i++) cacheValid[i] = 0;
@@ -126,7 +148,7 @@ static bool inFlash(uint64_t h) {
   uint32_t rangeCount = endPos - startPos + 1;
   if (rangeCount > (uint32_t)MAX_RANGE) rangeCount = MAX_RANGE;
 
-  blocklist.seek((uint32_t)startPos * HASH_BYTES);
+  blocklist.seek(blocklistOffset + (uint32_t)startPos * HASH_BYTES);
   blocklist.read(rangeBuf, (uint32_t)rangeCount * HASH_BYTES);
 
   for (uint32_t i = 0; i < rangeCount; i++) {
@@ -362,28 +384,138 @@ static void handleBan() {
   web.send(200, "text/plain", "ok");
 }
 
+// ---------- blocklist validation ----------
+// CRC-32 (IEEE 802.3, reflected) -- matches Python zlib.crc32. Nibble table so the
+// whole routine stays a few dozen bytes of flash. Covers the payload only.
+static uint32_t crc32Update(uint32_t crc, const uint8_t* p, size_t n) {
+  static uint32_t tab[16];
+  static bool init = false;
+  if (!init) {
+    for (uint32_t i = 0; i < 16; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 4; k++) c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1)));
+      tab[i] = c;
+    }
+    init = true;
+  }
+  crc = ~crc;
+  while (n--) { crc ^= *p++; crc = (crc >> 4) ^ tab[crc & 0xF]; crc = (crc >> 4) ^ tab[crc & 0xF]; }
+  return ~crc;
+}
+
+// Parse and verify an open blocklist file. Returns the entry count (0 = unusable)
+// and sets dataOffset to the first payload byte: BL_HEADER_SIZE for a v1 container,
+// 0 for a legacy raw blob. allowLegacy adds read-only support for headerless files
+// so a list left by older firmware keeps working across a firmware upgrade; upload
+// and remote commit pass false and so accept only a v1 container. Reads the payload
+// once to check the CRC.
+static uint32_t validBlocklist(File& f, bool allowLegacy, uint32_t& dataOffset, bool& isLegacy) {
+  dataOffset = 0; isLegacy = false;
+  if (!f) return 0;
+  const size_t size = f.size();
+  if (size < BL_HEADER_SIZE) {                        // too short to hold a header
+    if (allowLegacy && size > 0 && (size % HASH_BYTES) == 0) { isLegacy = true; return (uint32_t)(size / HASH_BYTES); }
+    return 0;
+  }
+  uint8_t hdr[BL_HEADER_SIZE];
+  f.seek(0);
+  if (f.read(hdr, BL_HEADER_SIZE) != BL_HEADER_SIZE) return 0;
+  if (memcmp(hdr, BL_MAGIC, 4) != 0) {                // not a container (e.g. an old raw .bin)
+    if (allowLegacy && (size % HASH_BYTES) == 0) { isLegacy = true; return (uint32_t)(size / HASH_BYTES); }
+    return 0;
+  }
+  if (hdr[4] != BL_VERSION) return 0;                 // a container of a version we don't know
+  if (hdr[5] != HASH_BYTES) return 0;                 // built for a different hash width
+  if (hdr[6] != 0 || hdr[7] != 0) return 0;           // reserved must be zero (producer/CI/consumer agree)
+  uint32_t count = (uint32_t)hdr[8]  | ((uint32_t)hdr[9]  << 8) | ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
+  uint32_t want  = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) | ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
+  if (count == 0) return 0;
+  uint64_t payload = (uint64_t)count * HASH_BYTES;
+  if ((uint64_t)BL_HEADER_SIZE + payload != (uint64_t)size) return 0;   // extra/trailing data -> reject
+  f.seek(BL_HEADER_SIZE);
+  uint32_t crc = 0, left = (uint32_t)payload; uint8_t chunk[512];
+  while (left) {
+    size_t want_n = left > sizeof(chunk) ? sizeof(chunk) : left;
+    size_t n = f.read(chunk, want_n);
+    if (n != want_n) return 0;
+    crc = crc32Update(crc, chunk, n);
+    left -= n;
+  }
+  if (crc != want) return 0;
+  dataOffset = BL_HEADER_SIZE;
+  return count;
+}
+
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
+// A new list lands in /blocklist.new first. We verify it and only then promote it,
+// so a bad or interrupted transfer never costs us the working list. Promotion is a
+// two-step rename (live -> /blocklist.old, then new -> live) and boot repairs an
+// interrupted swap, so the update is crash-safe. Renames do not copy, so peak flash
+// use is still old + new: the list must leave that headroom in the LittleFS partition.
 static void reopenBlocklist() {
+  if (blocklist) blocklist.close();
+  blocklistOffset = 0; numHashes = 0;
+  bool legacy = false;
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+  uint32_t count = blocklist ? validBlocklist(blocklist, true, blocklistOffset, legacy) : 0;
+
+  if (!count) {
+    // Live list is absent or invalid: repair an interrupted swap. Drop the bad
+    // live file, then try the previous list, then a verified-but-unpromoted one.
+    // /blocklist.old was a live list, so it may predate the container (legacy).
+    // /blocklist.new is a staging file this firmware wrote, so it must be v1.
+    if (blocklist) blocklist.close();
+    LittleFS.remove(BLOCKLIST_PATH);
+    const char* recover[]       = { BLOCKLIST_OLD, BLOCKLIST_NEW };
+    const bool  recoverLegacy[] = { true,          false };
+    for (int i = 0; i < 2 && !count; i++) {
+      if (!LittleFS.exists(recover[i]) || !LittleFS.rename(recover[i], BLOCKLIST_PATH)) continue;
+      blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+      count = blocklist ? validBlocklist(blocklist, recoverLegacy[i], blocklistOffset, legacy) : 0;
+      if (count) Serial.printf("blocklist: recovered %s after an interrupted swap\n", recover[i]);
+      else { if (blocklist) blocklist.close(); LittleFS.remove(BLOCKLIST_PATH); }
+    }
+  }
+
+  if (!count) { if (blocklist) blocklist.close(); Serial.println("blocklist: none/invalid on flash -> no blocking"); return; }
+  LittleFS.remove(BLOCKLIST_OLD);                 // swap finished; nothing left to recover
+  LittleFS.remove(BLOCKLIST_NEW);                 // stale staging file, if any
+  numHashes = count;
   buildFlashIndex();
+  if (legacy) Serial.printf("blocklist: %u domains (LEGACY raw format; rebuild or update to the v1 container)\n", numHashes);
+  else        Serial.printf("blocklist: %u domains (format v%u, %u-byte hashes)\n", numHashes, BL_VERSION, HASH_BYTES);
 }
 static void beginBlocklistSwap() {
-  if (blocklist) blocklist.close();
-  numHashes = 0;
-  LittleFS.remove(BLOCKLIST_PATH);
-  LittleFS.remove("/blocklist.new");
+  // Leave the live list untouched; only clear a stale temp file.
+  LittleFS.remove(BLOCKLIST_NEW);
 }
-static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
-  File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
-  reopenBlocklist();
-  return ok;
+static bool commitNewBlocklist(bool allowLegacy) {   // /blocklist.new -> live (validated)
+  File f = LittleFS.open(BLOCKLIST_NEW, "r");
+  uint32_t off = 0; bool legacy = false;
+  uint32_t count = validBlocklist(f, allowLegacy, off, legacy);
+  if (f) f.close();
+  if (!count) { LittleFS.remove(BLOCKLIST_NEW); return false; }   // live list unchanged
+  // Crash-safe promote: the old list stays on flash as /blocklist.old until the new
+  // one is live, so a power loss at any point is repaired by reopenBlocklist().
+  if (blocklist) blocklist.close();
+  LittleFS.remove(BLOCKLIST_OLD);
+  if (LittleFS.rename(BLOCKLIST_PATH, BLOCKLIST_OLD)) {
+    if (!LittleFS.rename(BLOCKLIST_NEW, BLOCKLIST_PATH)) {   // promote failed -> roll back
+      LittleFS.rename(BLOCKLIST_OLD, BLOCKLIST_PATH);
+      reopenBlocklist();
+      return false;
+    }
+  } else if (!LittleFS.rename(BLOCKLIST_NEW, BLOCKLIST_PATH)) {  // no live list (first install)
+    reopenBlocklist();
+    return false;
+  }
+  LittleFS.remove(BLOCKLIST_OLD);
+  // Already verified -> open and index without a second payload pass.
+  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+  blocklistOffset = off;
+  numHashes = count;
+  buildFlashIndex();
+  return true;
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
@@ -393,7 +525,7 @@ static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : "rejected: not a valid v1 blocklist container (bad magic/version/size/CRC?)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -402,7 +534,7 @@ static void handleUpload() {
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false; beginBlocklistSwap();
-      upFile = LittleFS.open("/blocklist.new", "w");
+      upFile = LittleFS.open(BLOCKLIST_NEW, "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
@@ -411,28 +543,35 @@ static void handleUpload() {
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      upOk = commitNewBlocklist();
+      upOk = commitNewBlocklist(false);            // uploads must be a v1 container
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
+      LittleFS.remove(BLOCKLIST_NEW);              // live list was never touched
       Serial.println("[ota] aborted");
       break;
   }
 }
 
 // ---------- remote blocklist auto-update ----------
+static void saveUpdateCfg() {
+  updateUrl.trim();
+  if (updateUrl == OFFICIAL_RAW_URL) {
+    updateUrl = OFFICIAL_V1_URL;
+    updateStatus = "official URL migrated to blocklist-v1.bin";
+    Serial.println("[remote] migrated official raw URL to blocklist-v1.bin");
+  }
+  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
+  f.println(updateUrl); f.println(updateIntervalH); f.close();
+}
 static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
   f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
-}
-static void saveUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
-  f.println(updateUrl); f.println(updateIntervalH); f.close();
+  if (updateUrl == OFFICIAL_RAW_URL) saveUpdateCfg();
 }
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
@@ -446,8 +585,8 @@ static bool fetchBlocklist(String url) {
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
   beginBlocklistSwap();
-  File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+  File f = LittleFS.open(BLOCKLIST_NEW, "w");
+  if (!f) { http.end(); updateStatus = "fs open failed"; LittleFS.remove(BLOCKLIST_NEW); return false; }
   WiFiClient* stream = http.getStreamPtr();
   int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
   while (http.connected() && (len < 0 || (int)total < len)) {
@@ -456,8 +595,8 @@ static bool fetchBlocklist(String url) {
     else { if (millis() - idle > 15000) break; delay(2); }
   }
   f.close(); http.end();
-  bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+  bool ok = commitNewBlocklist(false);             // remote must serve a v1 container
+  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("not a v1 container (" + String(total) + "B)");
   Serial.printf("[remote] %s\n", updateStatus.c_str());
   return ok;
 }
@@ -569,12 +708,7 @@ void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) {
-    numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    buildFlashIndex();
-  }
+  reopenBlocklist();                    // opens + CRC-checks /blocklist.bin, else fail-open
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
