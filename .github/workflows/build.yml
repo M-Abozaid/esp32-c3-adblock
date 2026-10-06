@@ -51,3 +51,5 @@ jobs:
           python3 tools/build_blocklist.py --format raw t-raw.bin t.txt
           test "$(stat -c%s t-raw.bin)" -eq 15   # 3 entries x 5 bytes, no header
           cmp t-raw.bin <(tail -c +17 t-v1.bin)  # raw output == container payload
+      - name: Unit tests
+        run: python3 tools/test_build_blocklist.py

@@ -1,6 +1,6 @@
 # Dual-OTA layout for 4MB flash: two app slots (firmware OTA) + LittleFS (blocklist).
 # Firmware ~1.24MB (TLS+HTTP+OTA), so slots are 1.3125MB (~134KB headroom each).
-# That leaves 1.3125MB for the blocklist (~250k domains @ 5 bytes).
+# LittleFS gets 1.3125 MB. Keep each list below 600,000 bytes for live and staging files.
 # Name,     Type, SubType, Offset,   Size
 nvs,        data, nvs,     0x9000,   0x5000
 otadata,    data, ota,     0xe000,   0x2000

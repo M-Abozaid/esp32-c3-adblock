@@ -1,8 +1,7 @@
 name: blocklist
 
-# Rebuilds the default blocklist weekly and publishes it at a stable URL:
-#   https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin
-# Point a device's "Remote auto-update" at that URL and it stays current on its own.
+# Rebuild the default blocklist weekly. Current firmware uses blocklist-v1.bin.
+# Older firmware uses the legacy blocklist.bin from the same release.
 on:
   schedule:
     - cron: "17 4 * * 1"   # Mondays 04:17 UTC
@@ -29,7 +28,7 @@ jobs:
           echo "v1=$size1 bytes  raw=$sizer bytes"
           test "$(head -c4 blocklist-v1.bin)" = "C3BL"   # versioned container magic
           test "$size1" -gt 250016                        # >50k entries + 16-byte header
-          test "$size1" -lt 1300000                       # fits the dual-OTA filesystem partition
+          test "$size1" -lt 600000                        # leave room for live and staging files
           test "$sizer" -eq $((size1 - 16))               # raw payload == container payload
           python3 - <<'PY'
           import struct, zlib

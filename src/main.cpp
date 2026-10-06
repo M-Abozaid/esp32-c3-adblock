@@ -81,7 +81,9 @@ static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
 
 // remote blocklist auto-update
-String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
+static const char* OFFICIAL_RAW_URL = "https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin";
+static const char* OFFICIAL_V1_URL = "https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist-v1.bin";
+String updateUrl = "";              // URL of a prebuilt v1 blocklist
 uint32_t updateIntervalH = 24;      // hours between auto-fetches
 uint32_t lastCheckMs = 0;
 String updateStatus = "never";
@@ -314,6 +316,26 @@ static bool handleDns() {
 // ---------- web ----------
 static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
 static String jesc(const String& s) { String o; for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; } return o; }
+// HTML text/attribute escaping for the setup portal. jesc() covers JSON (stats
+// endpoint); the portal builds HTML, and its inputs — a scanned SSID, the
+// submitted WiFi name — are attacker-controllable during provisioning (the
+// portal AP is open, and a nearby attacker can also broadcast an SSID of their
+// choosing). Without escaping both, a crafted SSID/name is reflected script
+// into the setup page, the same class as the dashboard XSS fixed earlier.
+static String htmlEscape(const String& s) {
+  String o; o.reserve(s.length());
+  for (char ch : s) {
+    switch (ch) {
+      case '&':  o += "&amp;";  break;
+      case '<':  o += "&lt;";   break;
+      case '>':  o += "&gt;";   break;
+      case '"':  o += "&quot;"; break;
+      case '\'': o += "&#39;";  break;
+      default:   o += ch;
+    }
+  }
+  return o;
+}
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 
@@ -534,15 +556,22 @@ static void handleUpload() {
 }
 
 // ---------- remote blocklist auto-update ----------
+static void saveUpdateCfg() {
+  updateUrl.trim();
+  if (updateUrl == OFFICIAL_RAW_URL) {
+    updateUrl = OFFICIAL_V1_URL;
+    updateStatus = "official URL migrated to blocklist-v1.bin";
+    Serial.println("[remote] migrated official raw URL to blocklist-v1.bin");
+  }
+  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
+  f.println(updateUrl); f.println(updateIntervalH); f.close();
+}
 static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
   f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
-}
-static void saveUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
-  f.println(updateUrl); f.println(updateIntervalH); f.close();
+  if (updateUrl == OFFICIAL_RAW_URL) saveUpdateCfg();
 }
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
@@ -644,7 +673,7 @@ static void handleWifiSave() {
   if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
   web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
-                             "&#9989; Saved. Restarting and joining <b>" + ss + "</b>&hellip;<br><br>"
+                             "&#9989; Saved. Restarting and joining <b>" + htmlEscape(ss) + "</b>&hellip;<br><br>"
                              "Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</body>");
   delay(900); ESP.restart();
 }
@@ -652,7 +681,7 @@ static void handleWifiSave() {
 static void startConfigPortal() {
   int n = WiFi.scanNetworks();                 // scan while still in STA mode (no APSTA)
   portalOpts = "";
-  for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + jesc(WiFi.SSID(i)) + "'>";
+  for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
   uint8_t mac[6]; WiFi.macAddress(mac);
   char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
   WiFi.mode(WIFI_AP); WiFi.softAP(ap);

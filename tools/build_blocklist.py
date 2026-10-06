@@ -53,7 +53,7 @@ def header(count: int, payload: bytes) -> bytes:
     return MAGIC + struct.pack('<BBHII', FORMAT_VERSION, HASH_BYTES, 0, count, crc)
 
 
-# Daily driver that FITS alongside dual-OTA firmware slots (~250k domain budget):
+# Daily driver for the dual-OTA partition (weekly release limit: 600,000 bytes):
 # ads + trackers + malware, WhatsApp/social keep working. ~100k entries / 0.5 MB
 # (Hagezi's wildcard lists drop subdomains the firmware's parent-matching already covers).
 # Want more? swap light-onlydomains.txt -> pro-onlydomains.txt is 370k and ONLY fits the
@@ -126,9 +126,11 @@ def main():
             if line.startswith(('||', '@@', '|')) or any(c in line for c in '^$*'):
                 skipped += 1; continue    # other adblock syntax (regex, wildcards, cosmetic) -> skip
             parts = line.split()
-            d = parts[1] if len(parts) >= 2 and parts[0] in ('0.0.0.0','127.0.0.1','::1','::') \
-                else parts[0] if len(parts) == 1 else None
-            if d:
+            if parts[0] in ('0.0.0.0','127.0.0.1','::1','::'):
+                entries = parts[1:]
+            else:
+                entries = parts if len(parts) == 1 else []
+            for d in entries:
                 d = norm(d)
                 if '.' in d and ' ' not in d:
                     domains.add(d)

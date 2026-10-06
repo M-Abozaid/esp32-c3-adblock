@@ -77,6 +77,8 @@ The weekly release publishes two files from the same source list:
 Point current firmware at `blocklist-v1.bin`. Keep `blocklist.bin` for devices that
 still run older firmware. A format must not share a stable URL with another format.
 The next version will use `blocklist-v2.bin`.
+Current firmware changes the exact official legacy release URL to `blocklist-v1.bin`.
+It saves the new URL in `/update.cfg`. It does not change custom URLs.
 
 ### Build both files
 
@@ -99,8 +101,9 @@ python3 tools/build_blocklist.py --format raw data/blocklist.bin
   allowed there. `/blocklist.new` is a staging file this firmware wrote, so it must be
   a v1 container. Boot removes a stale `/blocklist.old` and `/blocklist.new` once a
   list loads.
-- The transfer needs room for two lists at once (old + new). A list near the maximum
-  size may not fit; the update then fails and the old list stays.
+- The transfer needs room for two lists at once (old + new). The weekly release
+  requires a v1 file below 600,000 bytes. This leaves room for filesystem metadata
+  and configuration in the 1.31 MB LittleFS partition.
 
 To move a device to the current format, upload a v1 file or point Remote auto-update
 at `blocklist-v1.bin`:

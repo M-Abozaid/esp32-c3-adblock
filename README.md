@@ -103,7 +103,7 @@ pio device monitor          # -> http://c3adblock.local
 `build_blocklist.py OUT.bin [SOURCE ...]` takes any mix of URLs and local files, in any of
 these formats:
 
-- **hosts files** — `0.0.0.0 ads.example.com`
+- **hosts files** — `0.0.0.0 ads.example.com tracker.example.com` (all domains on the line are included)
 - **plain domain lists** — one domain per line
 - **AdGuard / Adblock basic rules** — `||ads.example.com^` blocks, `@@||ok.example.com^`
   removes a domain (e.g. to mirror an AdGuard Home allowlist)
@@ -120,8 +120,9 @@ format is documented in [`docs/blocklist-format.md`](docs/blocklist-format.md). 
 that predates the container, build the legacy headerless form with `--format raw`.
 
 After a firmware upgrade that adds the container, an on-device raw `blocklist.bin` still
-loads in read-only mode (with a boot warning). Uploading a `--format v1` file, or pointing
-Remote auto-update at `blocklist-v1.bin`, moves the device to the current format.
+loads in read-only mode (with a boot warning). The firmware changes the exact official
+legacy release URL to `blocklist-v1.bin` and saves it in `/update.cfg`. Custom URLs stay
+as configured. Upload a v1 file or set a v1 URL to update a device with a custom URL.
 
 ### WiFi setup (no re-flash needed)
 
@@ -150,9 +151,11 @@ The dashboard at **http://c3adblock.local** does it all:
   pio run -t upload --upload-port c3adblock.local --upload-protocol espota
   ```
 
-**4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
-blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
-single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
+**4 MB flash tradeoff:** firmware OTA needs two app slots. This leaves about 1.31 MB
+for LittleFS. A safe blocklist update holds the live file and `/blocklist.new` at once.
+The weekly release limits each v1 file to less than 600,000 bytes (about 120,000 hashes).
+This leaves room for filesystem metadata and configuration. The aggressive 537k
+"ultimate" list only fits the single-app partition table. See `partitions.csv`.
 
 ## Security
 

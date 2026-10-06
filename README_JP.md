@@ -86,14 +86,14 @@ pio device monitor -e c3
 
 `http://c3adblock.local` のダッシュボードから操作できます。
 
-- **ブロックリスト**: 新しく作成した`blocklist.bin`（v1コンテナ形式）を*Blocklist → Upload*からアップロードできます。または、*Remote auto-update*にURLを設定すると、デバイスが定期的に作成済みファイルを取得します。現在のファームウェアはv1コンテナを使用します: `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist-v1.bin`。旧ファームウェアは従来のraw版 `.../blocklist.bin` を使い続けられます。
+- **ブロックリスト**: 新しく作成した`blocklist.bin`（v1コンテナ形式）を*Blocklist → Upload*からアップロードできます。または、*Remote auto-update*にURLを設定すると、デバイスが定期的に作成済みファイルを取得します。現在のファームウェアはv1コンテナを使用します: `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist-v1.bin`。旧ファームウェアは従来のraw版 `.../blocklist.bin` を使い続けられます。現在のファームウェアは、保存済みの公式raw版URLだけをv1版URLに変更し、`/update.cfg`に保存します。独自のURLは変更しません。
 - **ファームウェア**: *Firmware → OTA update*から`.pio/build/<environment>/firmware.bin`をアップロードできます。デバイスは内容を検証してから、新しいイメージで再起動します。CLIからWi-Fi経由で書き込むこともできます。
 
   ```bash
   pio run -t upload --upload-port c3adblock.local --upload-protocol espota
   ```
 
-**4 MBフラッシュでのトレードオフ:** ファームウェアOTAにはアプリ用領域が2つ必要です。そのため、ブロックリストに使えるのは約1.3 MB、最大約25万ドメインです。53万7,000件の強力な"ultimate"リストは、ファームウェアOTAを使わない単一アプリ用パーティションでのみ利用できます。用途に応じて`partitions.csv`を選んでください。
+**4 MBフラッシュでのトレードオフ:** ファームウェアOTAにはアプリ用領域が2つ必要です。LittleFSには約1.31 MBが残ります。安全な更新では、現在のリストと一時ファイルを同時に保存します。週次リリースのv1ファイルは600,000バイト未満（約12万ハッシュ）に制限します。ファイルシステムの管理情報と設定にも空き領域が必要です。53万7,000件の"ultimate"リストは、ファームウェアOTAを使わない単一アプリ用パーティションでのみ利用できます。`partitions.csv`を参照してください。
 
 ## 使い方
 
