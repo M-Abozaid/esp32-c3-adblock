@@ -455,11 +455,10 @@ static bool fetchBlocklist(String url) {
     }
   }
   WiFiClientSecure cs;
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-  if (https) cs.useBuiltinCACertBundle();
-#else
+  // Static bundle on ALL cores: there is no useBuiltinCACertBundle() in the
+  // Arduino API (neither 2.x WiFiClientSecure nor 3.x NetworkClientSecure),
+  // while setCACert() exists with the same signature on both.
   if (https) cs.setCACert(ROOT_CA_BUNDLE);
-#endif
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect

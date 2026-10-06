@@ -1,9 +1,10 @@
 #pragma once
 // TLS trust strategy for HTTPS blocklist downloads (fail closed, old list kept):
-// - Arduino 3.x: useBuiltinCACertBundle() (Mozilla bundle maintained by Espressif).
-// - Arduino 2.x: setCACert(ROOT_CA_BUNDLE) below (ISRG Root X1 + DigiCert
-//   Global Root CA/G2 + USERTrust RSA (Sectigo, github.com chain), enough for
-//   github.com -> release CDN redirects).
+// - All Arduino cores: setCACert(ROOT_CA_BUNDLE) below (ISRG Root X1 +
+//   DigiCert Global Root CA/G2 + USERTrust RSA (Sectigo, github.com chain),
+//   enough for github.com -> release CDN redirects). setCACert() exists with
+//   the same signature on 2.x (WiFiClientSecure) and 3.x (NetworkClientSecure);
+//   there is no useBuiltinCACertBundle() in either core's public API.
 // Maintenance: if GitHub/CDN rotates to a new root, refresh this bundle from
 // https://curl.se/ca/cacert.pem or the vendor CA pages and reflash. Plain HTTP
 // URLs skip TLS entirely (LAN testing only).
