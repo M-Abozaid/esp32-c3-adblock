@@ -88,9 +88,11 @@ def main():
             if line.startswith(('||', '@@', '|')) or any(c in line for c in '^$*'):
                 skipped += 1; continue    # other adblock syntax (regex, wildcards, cosmetic) -> skip
             parts = line.split()
-            d = parts[1] if len(parts) >= 2 and parts[0] in ('0.0.0.0','127.0.0.1','::1','::') \
-                else parts[0] if len(parts) == 1 else None
-            if d:
+            if parts[0] in ('0.0.0.0','127.0.0.1','::1','::'):
+                entries = parts[1:]
+            else:
+                entries = parts if len(parts) == 1 else []
+            for d in entries:
                 d = norm(d)
                 if '.' in d and ' ' not in d:
                     domains.add(d)

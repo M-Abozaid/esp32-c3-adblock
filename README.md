@@ -97,7 +97,7 @@ pio device monitor          # -> http://c3adblock.local
 `build_blocklist.py OUT.bin [SOURCE ...]` takes any mix of URLs and local files, in any of
 these formats:
 
-- **hosts files** — `0.0.0.0 ads.example.com`
+- **hosts files** — `0.0.0.0 ads.example.com tracker.example.com` (all domains on the line are included)
 - **plain domain lists** — one domain per line
 - **AdGuard / Adblock basic rules** — `||ads.example.com^` blocks, `@@||ok.example.com^`
   removes a domain (e.g. to mirror an AdGuard Home allowlist)
