@@ -144,6 +144,7 @@ state-changing endpoint requires **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from
 
 - `/ban`, `/addblock`, `/unblock`, `/forgetwifi`
 - `/setalias`, `/addclientblock`, `/unclientblock` (per-client policies)
+- `/setdnslog` (DNS query logging collector config)
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`
 
@@ -220,6 +221,59 @@ address rotates; policies follow the current MAC.
 Aliases and per-client rules persist across reboots in LittleFS
 (`/clientpol.txt`). Limits: 32 managed clients, 16 blocked domains each,
 alias up to 32 chars.
+
+## DNS Query Logging
+
+Optional, **off by default**. When enabled, the device emits a compact
+binary UDP datagram per DNS decision to an external collector on your LAN:
+
+```
+Client → ESP32 → UDP collector
+```
+
+- Dashboard section *DNS Query Logging*: Enable, Collector IP (IPv4, v1),
+  UDP port (default `40153`, `1..65535`), Mode (`OFF` / `BLOCKED_ONLY` / `ALL`).
+  Without Enable the effective mode is `OFF`. Config persists in LittleFS
+  (`/dnslog.cfg`) and is revalidated on boot — invalid config means logging
+  disabled, DNS keeps working.
+- Payload is binary (`34 + domain_length` bytes, max 287, version `1`,
+  event `0x01`), all multi-byte big-endian. Fixed fields: sequence `u32`
+  (wraps, RAM-only), timestamp `u32` (Unix, `0` = NTP not synced yet),
+  device ID 6 B (logical Lily identity for v1: derived from the ESP32 STA
+  MAC and stable for the lifetime of the device — not a hostname, so one
+  collector can serve many Lilys), client MAC 6 B (primary identity, survives
+  DHCP changes; all zeros = unknown, never blocks the query) + IPv4 4 B
+  (address observed at that moment), QTYPE `u16` (full numeric type, e.g.
+  `1`/`28`/`15` — preserved, never coerced), RCODE `u8` (actually delivered:
+  v1 records the 4-bit DNS header RCODE; extended EDNS RCODE is not
+  represented. `0`/`1`/`2`/`3`/`5`; locally blocked sinkhole/NODATA always
+  `0`; upstream timeout with no reply emits no event — failures are never
+  mislabeled as blocks), latency `u16` ms (saturated at `0xFFFF`),
+  transport `u8` (`0` = UDP, `1` = TCP — the query's transport, not the
+  telemetry's), flags (`bit0` blocked, `bit1` locally generated — blocked
+  lives only here), domain length + normalized domain only (max 253 chars).
+  No JSON, no HTTP/TLS, no retries, no persistent queue, no LittleFS history.
+- Fire-and-forget: the DNS reply goes out first, latency stops there, and
+  telemetry is queued in a small RAM queue (32 events, full → drop) drained
+  best-effort from `loop()`. Collector time is never inside `latency_ms`.
+  Collector offline/unknown/port closed → event silently dropped; DNS is
+  never delayed, retried, or marked unhealthy. Loss is acceptable — the
+  sequence number lets the backend *detect* gaps, never request resends.
+- Timestamp is Unix time when NTP has synced, else `0` (never blocks DNS).
+- One event per query max, on both UDP and TCP DNS, emitted after the
+  ban → per-client → global → forward decision (malformed, non-IN-class,
+  and rate-limited queries emit nothing). Upstream `NXDOMAIN`/`SERVFAIL`
+  arrive as `blocked=false` with the real RCODE. Logs record queried
+  domains, not full HTTPS URLs or page contents.
+- Counters (`generated` / `dispatched` / `dropped`) and *Last event
+  dispatched* are RAM-only diagnostics in `/stats.json`. "Dispatched" means
+  handed to UDP — delivery is not guaranteed.
+- Security: the channel is unauthenticated LAN telemetry. The ESP32 never
+  interprets inbound UDP as commands (send-only socket), and no passwords,
+  cookies, configs, or request contents ever leave the device.
+
+The collector (UDP receiver → database → API → UI) is a separate project and
+is intentionally **not** part of this firmware.
 
 ## Gotchas (learned the hard way)
 
