@@ -47,7 +47,12 @@ The firmware accepts a file only when all rules hold:
 The firmware checks the CRC when it commits an upload or a remote fetch. It checks
 the CRC again when it loads the file at boot.
 
-If the file is invalid, the firmware loads no list. The device then forwards all
+The firmware also accepts a legacy raw file (no header) when it has to keep working:
+at boot, and for a remote fetch during migration. It reads the count as
+`size / hash_bytes` and prints a warning. Upload rejects a raw file. See
+Compatibility below.
+
+If no list is valid, the firmware loads no list. The device then forwards all
 queries and blocks nothing. This is a fail-open design. The device stays reachable.
 
 ## Versioning policy
@@ -59,15 +64,43 @@ queries and blocks nothing. This is a fail-open design. The device stays reachab
   file with older code.
 - A build tool writes exactly one version. It does not down-convert.
 
-## Compatibility
+## Distribution
 
-Firmware with container support rejects the old raw (headerless) blocklist. After
-an upgrade, rebuild or re-upload the list once:
+The weekly release publishes two files from the same source list:
+
+| File | Format | Reader |
+|---|---|---|
+| `blocklist-v1.bin` | v1 container | current firmware |
+| `blocklist.bin` | legacy raw payload | firmware without container support |
+
+Point current firmware at `blocklist-v1.bin`. Keep `blocklist.bin` for devices that
+still run older firmware. A format must not share a stable URL with another format.
+The next version will use `blocklist-v2.bin`.
+
+### Build both files
 
 ```bash
-python3 tools/build_blocklist.py data/blocklist.bin
-pio run -t uploadfs
+python3 tools/build_blocklist.py --format v1  data/blocklist-v1.bin
+python3 tools/build_blocklist.py --format raw data/blocklist.bin
 ```
 
-A device that uses Remote auto-update replaces the list on its own. The weekly
-GitHub Actions release already uses the container format.
+## Compatibility
+
+- The firmware loads a v1 container. It also loads a legacy raw file in read-only
+  mode and prints a warning. An on-flash raw list keeps blocking across a firmware
+  upgrade.
+- Upload accepts a v1 container only. A raw upload is rejected.
+- Remote auto-update accepts both a v1 container and a legacy raw file. The raw path
+  exists only for migration and will be removed in a later release.
+- The firmware keeps the live list until a new file is fully received and verified.
+  A bad or interrupted transfer keeps the old list. The transfer needs room for two
+  lists at once (old + new). A list near the maximum size may not fit; the update
+  then fails and the old list stays.
+
+To move a device to the current format, upload a v1 file or point Remote auto-update
+at `blocklist-v1.bin`:
+
+```bash
+python3 tools/build_blocklist.py --format v1 data/blocklist-v1.bin
+pio run -t uploadfs
+```

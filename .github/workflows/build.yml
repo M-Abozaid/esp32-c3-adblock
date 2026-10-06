@@ -33,18 +33,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Parse hosts, plain and AdGuard-style input; verify the container
+      - name: Parse hosts, plain and AdGuard-style input; verify both formats
         run: |
           printf '||ads.example.com^\n@@||ok.example.org^\n||ok.example.org^\n0.0.0.0 hosts.example.com\nplain.example.com\n/^regex$/\n' > t.txt
-          python3 tools/build_blocklist.py t.bin t.txt
-          test "$(stat -c%s t.bin)" -eq 31   # 16-byte header + 3 entries x 5 bytes
+          python3 tools/build_blocklist.py --format v1 t-v1.bin t.txt
+          test "$(stat -c%s t-v1.bin)" -eq 31   # 16-byte header + 3 entries x 5 bytes
           python3 - <<'PY'
           import struct, zlib
-          d = open('t.bin', 'rb').read()
+          d = open('t-v1.bin', 'rb').read()
           assert d[:4] == b'C3BL', 'bad magic'
           ver, hb, resv, count, crc = struct.unpack('<BBHII', d[4:16])
           assert (ver, hb, resv, count) == (1, 5, 0, 3), (ver, hb, resv, count)
           assert len(d) == 16 + count * hb, 'size mismatch'
           assert zlib.crc32(d[16:]) & 0xffffffff == crc, 'CRC mismatch'
-          print('container header + CRC OK')
+          print('v1 container header + CRC OK')
           PY
+          python3 tools/build_blocklist.py --format raw t-raw.bin t.txt
+          test "$(stat -c%s t-raw.bin)" -eq 15   # 3 entries x 5 bytes, no header
+          cmp t-raw.bin <(tail -c +17 t-v1.bin)  # raw output == container payload

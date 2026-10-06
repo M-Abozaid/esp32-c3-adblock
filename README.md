@@ -12,8 +12,9 @@ fit in ~0.7 MB of flash and are matched in ~10 ms, using **~50 KB of RAM**.
 
 The file is a small versioned container: a 16-byte header (magic `C3BL`, format
 version, hash width, entry count, CRC32) followed by the sorted hashes. The firmware
-rejects any file without a valid header and CRC, so a random blob or an old-format
-file never loads. See [`docs/blocklist-format.md`](docs/blocklist-format.md).
+rejects any file without a valid header and CRC, so a random blob never loads. A file
+in the old raw format still loads in read-only mode, so an upgrade does not drop the
+list. See [`docs/blocklist-format.md`](docs/blocklist-format.md).
 
 ```
 query in ──▶ extract domain ──▶ FNV-1a hash (+ parent suffixes)
@@ -115,9 +116,12 @@ can't be downloaded the build stops instead of silently producing a smaller list
 
 The output is a versioned container (16-byte header + payload). The firmware validates the
 header and the payload CRC32 before it loads the list, so a random file is rejected. The
-format is documented in [`docs/blocklist-format.md`](docs/blocklist-format.md). Note: after
-a firmware upgrade that adds the container, an on-device raw `blocklist.bin` is no longer
-loaded — rebuild it (`pio run -t uploadfs`) or re-upload it once.
+format is documented in [`docs/blocklist-format.md`](docs/blocklist-format.md). For firmware
+that predates the container, build the legacy headerless form with `--format raw`.
+
+After a firmware upgrade that adds the container, an on-device raw `blocklist.bin` still
+loads in read-only mode (with a boot warning). Uploading a `--format v1` file, or pointing
+Remote auto-update at `blocklist-v1.bin`, moves the device to the current format.
 
 ### WiFi setup (no re-flash needed)
 
@@ -132,10 +136,13 @@ just visit — see Security below.)
 
 The dashboard at **http://c3adblock.local** does it all:
 
-- **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
-  URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
-  on a schedule. A fresh default list is rebuilt **every Monday** by GitHub Actions and
-  published at a stable URL, so pasting this once keeps a device current on its own:
+- **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload* (uploads
+  must be the v1 container), or set a URL under *Remote auto-update* and the device pulls a
+  prebuilt file on a schedule. A fresh default list is rebuilt **every Monday** by GitHub
+  Actions and published at a stable URL, so pasting this once keeps a device current on its
+  own. Current firmware uses the v1 container:
+  `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist-v1.bin`
+  Older firmware keeps working on the legacy raw artifact:
   `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin`
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
   device verifies it and reboots into the new image. Or push over WiFi from the CLI:

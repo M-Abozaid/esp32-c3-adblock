@@ -9,7 +9,7 @@
 
 要点は、ブロックリスト全体をRAMに置く必要はないことです。ドメインを**ソート済みの40ビットハッシュ**としてフラッシュに保存し、二分探索で照合します。140,000件を超えるドメインを約0.7 MBのフラッシュに収め、約50 KBのRAMだけで照合できます。
 
-ファイルは小さなバージョン付きコンテナです。16バイトのヘッダ（マジック`C3BL`、フォーマットバージョン、ハッシュ幅、エントリ数、CRC32）の後ろにソート済みハッシュが続きます。ファームウェアはヘッダとCRCが正しくないファイルを読み込みません。詳細は[`docs/blocklist-format.md`](docs/blocklist-format.md)を参照してください。
+ファイルは小さなバージョン付きコンテナです。16バイトのヘッダ（マジック`C3BL`、フォーマットバージョン、ハッシュ幅、エントリ数、CRC32）の後ろにソート済みハッシュが続きます。ファームウェアはヘッダとCRCが正しくないファイルを読み込みません。旧raw形式のファイルは読み取り専用で読み込めるため、アップグレードでリストが失われることはありません。詳細は[`docs/blocklist-format.md`](docs/blocklist-format.md)を参照してください。
 
 ```
 DNSクエリ受信 ──▶ ドメインを抽出 ──▶ FNV-1aハッシュを計算（親サフィックスも対象）
@@ -86,7 +86,7 @@ pio device monitor -e c3
 
 `http://c3adblock.local` のダッシュボードから操作できます。
 
-- **ブロックリスト**: 新しく作成した`blocklist.bin`を*Blocklist → Upload*からアップロードできます。または、*Remote auto-update*にURLを設定すると、デバイスが定期的に作成済みの`blocklist.bin`を取得します。たとえばGitHubリリースのアセットを指定すれば、一度更新するだけで全デバイスが取得できます。
+- **ブロックリスト**: 新しく作成した`blocklist.bin`（v1コンテナ形式）を*Blocklist → Upload*からアップロードできます。または、*Remote auto-update*にURLを設定すると、デバイスが定期的に作成済みファイルを取得します。現在のファームウェアはv1コンテナを使用します: `https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist-v1.bin`。旧ファームウェアは従来のraw版 `.../blocklist.bin` を使い続けられます。
 - **ファームウェア**: *Firmware → OTA update*から`.pio/build/<environment>/firmware.bin`をアップロードできます。デバイスは内容を検証してから、新しいイメージで再起動します。CLIからWi-Fi経由で書き込むこともできます。
 
   ```bash

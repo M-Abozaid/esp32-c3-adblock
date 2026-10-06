@@ -21,7 +21,10 @@ without mixing old and new .bin files.
 HASH_BYTES MUST match the firmware (src/main.cpp). 5 bytes (40-bit) keeps
 ~0 collisions up to ~500k domains while fitting half a million in <3 MB.
 
-Usage: build_blocklist.py [out.bin] [src ...]
+Usage: build_blocklist.py [--format v1|raw] [--allow-missing] [out.bin] [src ...]
+  --format v1  (default) writes the versioned container (magic + version + CRC32).
+  --format raw writes the legacy headerless payload only. Keep it for older
+               firmware that cannot read the container.
   src = local file or URL. With none given, downloads a balanced daily-driver set
   (StevenBlack base + Hagezi Light) ~= 100k entries: blocks ads/trackers/malware
   but leaves WhatsApp/Instagram/social/messaging working.
@@ -83,8 +86,18 @@ def read_source(src: str) -> str:
 
 def main():
     global ALLOW_MISSING
-    args = [a for a in sys.argv[1:] if a != '--allow-missing']
-    ALLOW_MISSING = '--allow-missing' in sys.argv[1:]
+    argv = sys.argv[1:]
+    fmt = 'v1'
+    if '--format' in argv:
+        i = argv.index('--format')
+        if i + 1 >= len(argv):
+            sys.exit('--format needs a value: v1 or raw')
+        fmt = argv[i + 1]
+        del argv[i:i + 2]
+    if fmt not in ('v1', 'raw'):
+        sys.exit('--format must be v1 or raw')
+    ALLOW_MISSING = '--allow-missing' in argv
+    args = [a for a in argv if a != '--allow-missing']
     out = args[0] if args else 'blocklist.bin'
     sources = args[1:] if len(args) > 1 else DEFAULT_SOURCES
 
@@ -129,17 +142,20 @@ def main():
     collisions = len(hashes) - len(set(hashes))
     uniq = sorted(set(hashes))                       # one entry per distinct hash
     payload = b''.join(h.to_bytes(HASH_BYTES, 'little') for h in uniq)
-    blob = header(len(uniq), payload) + payload
+    blob = payload if fmt == 'raw' else header(len(uniq), payload) + payload
     with open(out, 'wb') as f:
         f.write(blob)
 
     n = len(uniq)
     payload_size = n * HASH_BYTES
-    total = HEADER_SIZE + payload_size
+    total = len(blob)
     print(f'source domains   : {len(domains):,}')
     print(f'hash entries     : {n:,}  ({HASH_BYTES}-byte / {HASH_BYTES*8}-bit)')
     print(f'collisions       : {collisions}  (domains sharing a hash -> over-block)')
-    print(f'container        : v{FORMAT_VERSION}, {HEADER_SIZE}-byte header + {payload_size:,} B payload = {total:,} B')
+    if fmt == 'raw':
+        print(f'format           : legacy raw (no header) -- for older firmware')
+    else:
+        print(f'container        : v{FORMAT_VERSION}, {HEADER_SIZE}-byte header + {payload_size:,} B payload = {total:,} B')
     print(f'flash blob       : {total:,} bytes  ({total/1024/1024:.2f} MB)  -> {out}')
     print(f'lookup           : ~{math.ceil(math.log2(max(n,2)))} reads/query')
 
