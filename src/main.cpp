@@ -15,10 +15,12 @@
 #include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
+#include <time.h>              // NTP time for TLS certificate validation
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
+#include "certs.h"     // ROOT_CA_BUNDLE for validated HTTPS blocklist downloads
 
 // ---- config ----
 #ifndef UPSTREAM_IP
@@ -169,19 +171,66 @@ static bool isBlocked(const char* domain) {
   return false;
 }
 
+// ---------- input validation (firmware-side; never trust browser JS) ----------
+static bool hasControlChars(const String& s) {
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c < 0x20 || c == 0x7F) return true;
+  }
+  return false;
+}
+// Reasonable hostname check: labels of [a-z0-9-], 1..63 chars, no leading or
+// trailing hyphen, 1..253 total, at least one dot. Rejects HTML/JS/control
+// payloads without breaking legitimate hostnames.
+static bool isValidDomain(String d) {
+  d.trim(); d.toLowerCase();
+  if (d.startsWith("www.")) d = d.substring(4);
+  if (d.length() < 3 || d.length() > 253) return false;
+  if (hasControlChars(d)) return false;
+  if (d.indexOf('.') < 0) return false;
+  int labels = 0, len = 0;
+  for (size_t i = 0; i <= d.length(); i++) {
+    char c = i < d.length() ? d[i] : '.';
+    if (c == '.') {
+      if (len < 1 || len > 63) return false;
+      labels++; len = 0;
+    } else {
+      bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+      if (!ok) return false;
+      if (c == '-' && (len == 0 || i + 1 >= d.length() || d[i + 1] == '.')) return false;
+      if (++len > 63) return false;
+    }
+  }
+  return labels >= 2;
+}
+// Update URL policy: HTTPS only by default. Plain HTTP would let a LAN
+// attacker replace the blocklist, so it is rejected unless the build
+// explicitly opts in with -DALLOW_HTTP_BLOCKLIST=1 for isolated LAN testing.
+// Private/LAN hosts are allowed because only an authenticated admin can set
+// the URL (documented SSRF surface, not an unauthenticated vector).
+static bool isValidUpdateUrl(const String& u) {
+  if (u.length() < 8 || u.length() > 200) return false;
+  if (hasControlChars(u)) return false;
+  if (u.indexOf(' ') >= 0) return false;
+#ifdef ALLOW_HTTP_BLOCKLIST
+  return u.startsWith("https://") || u.startsWith("http://");
+#else
+  return u.startsWith("https://");
+#endif
+}
 // ---------- persistence ----------
 static void loadCustom() {
   numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
     String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    if (isValidDomain(l)) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
   }
   f.close();
 }
 static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
 static bool addCustom(String d) {
   d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
+  if (!isValidDomain(d) || numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
   customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
 }
@@ -220,7 +269,14 @@ static Dev* getClient(uint32_t ip) {
     c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
     getMac(ip, c->mac); return c;
   }
-  return nullptr;
+  // Table full: evict the least-recently-seen client so one scanner cannot
+  // pin the table.
+  int oldest = 0;
+  for (int i = 1; i < numClients; i++)
+    if ((int32_t)(clients[i].lastSeen - clients[oldest].lastSeen) < 0) oldest = i;
+  Dev* c = &clients[oldest];
+  c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
+  getMac(ip, c->mac); return c;
 }
 
 // ---------- DNS ----------
@@ -350,9 +406,51 @@ static void handleStats() {
 // drive-by case without needing TLS, cookies, or a token endpoint.
 static const char* CSRF_HEADER = "X-Requested-With";
 static const char* CSRF_VALUE  = "c3-adblock";
+static const char* AUTH_HEADER = "Authorization";
+// Brute-force mitigation (per-IP, expiring; never locks the admin out globally):
+// 5 failures -> 30s lockout, 10+ failures -> 5min lockout for that IP only.
+// A browser's first credential-less 401 (no Authorization header yet) is NOT
+// counted as a failure — only actual wrong credentials are.
+struct AuthFail { uint32_t ip; uint8_t fails; uint32_t untilMs; };
+static AuthFail authFails[8];
+static bool authLocked(uint32_t ip) {
+  uint32_t now = millis();
+  for (int i = 0; i < 8; i++)
+    if (authFails[i].ip == ip && authFails[i].fails >= 5 && (int32_t)(now - authFails[i].untilMs) < 0)
+      return true;
+  return false;
+}
+static void authNote(uint32_t ip, bool ok) {
+  uint32_t now = millis();
+  int slot = -1;
+  for (int i = 0; i < 8; i++) if (authFails[i].ip == ip) { slot = i; break; }
+  if (ok) { if (slot >= 0) authFails[slot].fails = 0; return; }
+  if (slot < 0) {
+    slot = 0;
+    for (int i = 0; i < 8; i++) if (authFails[i].fails == 0) { slot = i; break; }
+    authFails[slot].ip = ip; authFails[slot].fails = 0;
+  }
+  if (++authFails[slot].fails == 5) authFails[slot].untilMs = now + 30000UL;
+  else if (authFails[slot].fails >= 10) authFails[slot].untilMs = now + 300000UL;
+}
+// Single credential check shared by requireAuth() and both upload handlers,
+// so brute-force accounting can never diverge between auth paths.
+static bool checkCredentials() {
+  uint32_t rip = (uint32_t)web.client().remoteIP();
+  if (authLocked(rip)) return false;
+  if (web.header(CSRF_HEADER) != CSRF_VALUE) return false;
+  if (web.authenticate(WEB_USER, WEB_PASS)) { authNote(rip, true); return true; }
+  // No credentials supplied yet (browser's initial anonymous probe): challenge
+  // without recording a failure.
+  if (web.header(AUTH_HEADER).length() == 0) return false;
+  authNote(rip, false);
+  return false;
+}
 static bool requireAuth() {
+  uint32_t rip = (uint32_t)web.client().remoteIP();
+  if (authLocked(rip)) { web.send(429, "text/plain", "too many failures, retry later"); return false; }
   if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return false; }
-  if (web.authenticate(WEB_USER, WEB_PASS)) return true;
+  if (checkCredentials()) return true;
   web.requestAuthentication();
   return false;
 }
@@ -387,8 +485,11 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
+// Shared cap for browser upload and remote fetch.
+static const size_t MAX_BLOCKLIST_BYTES = 14 * 1024 * 1024;
 static bool upOk = false;
 static bool upAuthOk = false;
+static size_t upTotal = 0;
 static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
@@ -399,14 +500,22 @@ static void handleUpload() {
   HTTPUpload& u = web.upload();
   switch (u.status) {
     case UPLOAD_FILE_START:
-      upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+      upAuthOk = checkCredentials();
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false; beginBlocklistSwap();
+      upTotal = 0;
       upFile = LittleFS.open("/blocklist.new", "w");
-      Serial.printf("[ota] receiving %s\n", u.filename.c_str());
+      Serial.println("[ota] receiving blocklist upload");
       break;
     case UPLOAD_FILE_WRITE:
-      if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
+      if (upAuthOk && upFile) {
+        upTotal += u.currentSize;
+        if (upTotal > MAX_BLOCKLIST_BYTES) {
+          upFile.close(); LittleFS.remove("/blocklist.new");
+          upAuthOk = false; upOk = false;
+          Serial.println("[ota] upload too large, rejected");
+        } else upFile.write(u.buf, u.currentSize);
+      }
       break;
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
@@ -428,7 +537,9 @@ static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
-  f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
+  f.close();
+  if (updateIntervalH < 1) updateIntervalH = 1; if (updateIntervalH > 720) updateIntervalH = 720;
+  if (!isValidUpdateUrl(updateUrl)) updateUrl = "";
 }
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
@@ -437,11 +548,29 @@ static void saveUpdateCfg() {
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
+  bool https = url.startsWith("https");
+  if (https) {
+    // TLS certificate expiry checks need a valid clock. Sync once via NTP;
+    // on failure keep the old list instead of downloading unverified data.
+    if (time(nullptr) < 1704067200) {
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+      uint32_t t0 = millis();
+      while (time(nullptr) < 1704067200 && millis() - t0 < 8000) delay(200);
+    }
+    if (time(nullptr) < 1704067200) {
+      updateStatus = "time not set, TLS verify skipped (kept old list)";
+      Serial.printf("[remote] %s\n", updateStatus.c_str());
+      return false;
+    }
+  }
+  WiFiClientSecure cs;
+  // Static bundle on ALL cores: there is no useBuiltinCACertBundle() in the
+  // Arduino API (neither 2.x WiFiClientSecure nor 3.x NetworkClientSecure),
+  // while setCACert() exists with the same signature on both.
+  if (https) cs.setCACert(ROOT_CA_BUNDLE);
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
-  bool https = url.startsWith("https");
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
@@ -473,9 +602,9 @@ static void handleFwUpdateDone() {
 static void handleFwUpload() {
   HTTPUpload& u = web.upload();
   if (u.status == UPLOAD_FILE_START) {
-    fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
+    fwAuthOk = checkCredentials();
     if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
-    Serial.printf("[fw-ota] %s\n", u.filename.c_str());
+    Serial.println("[fw-ota] receiving firmware upload");
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_WRITE) {
     if (!fwAuthOk) return;
@@ -531,7 +660,9 @@ static void handlePortalRoot() {
 }
 static void handleWifiSave() {
   String ss = web.arg("s"), pw = web.arg("p");
-  if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
+  ss.trim();
+  if (!ss.length() || ss.length() > 32) { web.send(400, "text/plain", "invalid WiFi name"); return; }
+  if (pw.length() > 63 || hasControlChars(ss) || hasControlChars(pw)) { web.send(400, "text/plain", "invalid WiFi credentials"); return; }
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
   web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
                              "&#9989; Saved. Restarting and joining <b>" + htmlEscape(ss) + "</b>&hellip;<br><br>"
@@ -591,6 +722,7 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // TLS verify needs wall-clock time
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
   if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
@@ -599,15 +731,26 @@ void setup() {
                     "device on a network you don't fully control.");
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
-  { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
+  { const char* hdrs[] = { CSRF_HEADER, AUTH_HEADER }; web.collectHeaders(hdrs, 2); }  // needed for requireAuth()'s CSRF + credential-less checks
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
+  web.on("/addblock", []() {
+    if (!requireAuth()) return;
+    String d = web.arg("d");
+    if (d.length() > 253 || !addCustom(d)) { web.send(400, "text/plain", "invalid domain"); return; }
+    web.send(200, "text/plain", "ok");
+  });
+  web.on("/unblock", []() {
+    if (!requireAuth()) return;
+    String d = web.arg("d"); d.trim(); d.toLowerCase();
+    if (d.length() > 253 || hasControlChars(d)) { web.send(400, "text/plain", "invalid domain"); return; }
+    removeCustom(d); web.send(200, "text/plain", "ok");
+  });
+  web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite, max 24h)
     if (!requireAuth()) return;
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
+    if (s < 0) s = 0; if (s > 86400) s = 86400;
     blockingOn = false; resumeAt = (s > 0) ? millis() + (uint32_t)s * 1000UL : 0;
     web.send(200, "text/plain", "paused");
   });
@@ -619,8 +762,12 @@ void setup() {
   web.on("/fetchnow", []() { if (!requireAuth()) return; fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
   web.on("/setupdate", []() {
     if (!requireAuth()) return;
-    if (web.hasArg("u")) updateUrl = web.arg("u");
-    if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
+    if (web.hasArg("u")) {
+      String u = web.arg("u"); u.trim();
+      if (u.length() && !isValidUpdateUrl(u)) { web.send(400, "text/plain", "invalid URL (https only, max 200 chars)"); return; }
+      updateUrl = u;
+    }
+    if (web.hasArg("h")) { long h = web.arg("h").toInt(); if (h < 1) h = 1; if (h > 720) h = 720; updateIntervalH = (uint32_t)h; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
