@@ -192,6 +192,196 @@ static void removeCustom(String d) {
     numCustom--; saveCustom(); return;
   }
 }
+// ---- per-client domain policies (opt-in) ----
+// Build with -DENABLE_PER_CLIENT_RULES=1 to key blocking rules by client MAC
+// (ARP-resolved, survives DHCP renewals; persisted in /clientpol.txt).
+// Default OFF: the table below (~8.5KB static + heap) and all policy code
+// compile out, so C3 builds reserve zero RAM for this feature.
+#ifndef ENABLE_PER_CLIENT_RULES
+#define ENABLE_PER_CLIENT_RULES 0
+#endif
+#if ENABLE_PER_CLIENT_RULES
+// ---------- per-client domain policies ----------
+static String macStr(const uint8_t* m);  // defined in the web section below
+// Minimal local validation (converge with the auth-hardening PR on merge).
+static bool pcHasControlChars(const String& s) {
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c < 0x20 || c == 0x7F) return true;
+  }
+  return false;
+}
+static bool pcIsValidDomain(String d) {
+  d.trim(); d.toLowerCase();
+  if (d.startsWith("www.")) d = d.substring(4);
+  if (d.length() < 3 || d.length() > 253) return false;
+  if (pcHasControlChars(d)) return false;
+  if (d.indexOf('.') < 0) return false;
+  int labels = 0, len = 0;
+  for (size_t i = 0; i <= d.length(); i++) {
+    char c = i < d.length() ? d[i] : '.';
+    if (c == '.') {
+      if (len < 1 || len > 63) return false;
+      labels++; len = 0;
+    } else {
+      bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+      if (!ok) return false;
+      if (c == '-' && (len == 0 || i + 1 >= d.length() || d[i + 1] == '.')) return false;
+      if (++len > 63) return false;
+    }
+  }
+  return labels >= 2;
+}
+// Identity: MAC address resolved via ARP (see getMac). The DNS path only uses
+// the IP to find the current MAC; rules are keyed by MAC so DHCP renewals
+// keep working. A zero MAC (no ARP entry) gets no per-client rules.
+// Limitation: Wi-Fi MAC randomization (private address per network) creates a
+// new identity; policies follow the randomized MAC until the client resets it.
+static const int MAX_POLICY_CLIENTS = 32;
+static const int MAX_RULES_PER_CLIENT = 16;
+static const int MAX_ALIAS_LEN = 32;
+struct ClientPolicy { uint8_t mac[6]; bool used; String alias; String rule[MAX_RULES_PER_CLIENT]; uint64_t ruleHash[MAX_RULES_PER_CLIENT]; int ruleCount; };
+static ClientPolicy policies[MAX_POLICY_CLIENTS];
+static inline bool macIsZero(const uint8_t* m) { for (int i = 0; i < 6; i++) if (m[i]) return false; return true; }
+static inline bool macEq(const uint8_t* a, const uint8_t* b) { for (int i = 0; i < 6; i++) if (a[i] != b[i]) return false; return true; }
+// Strict aa:bb:cc:dd:ee:ff (accepts upper case, stores lower). Rejects
+// anything else so a crafted ?mac= can never address another client.
+static bool parseMac(const String& s, uint8_t* out) {
+  if (s.length() != 17) return false;
+  for (int i = 0; i < 17; i++) {
+    char c = s[i];
+    if (i % 3 == 2) { if (c != ':') return false; continue; }
+    bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!hex) return false;
+  }
+  auto nib = [](char c) -> uint8_t { return (uint8_t)(c <= '9' ? c - '0' : (c <= 'F' ? c - 'A' + 10 : c - 'a' + 10)); };
+  for (int i = 0; i < 6; i++) out[i] = (uint8_t)((nib(s[i * 3]) << 4) | nib(s[i * 3 + 1]));
+  return true;
+}
+// Alias is metadata only: 0..32 chars (empty clears), no control chars, and
+// none of the persistence delimiters ('|', ',', newline). Everything else is
+// allowed and HTML/JSON-escaped on render.
+static bool isValidAlias(const String& a) {
+  if (a.length() > (size_t)MAX_ALIAS_LEN) return false;
+  if (pcHasControlChars(a)) return false;
+  if (a.indexOf('|') >= 0 || a.indexOf(',') >= 0 || a.indexOf('\n') >= 0 || a.indexOf('\r') >= 0) return false;
+  return true;
+}
+static ClientPolicy* findPolicy(const uint8_t* mac) {
+  if (!mac || macIsZero(mac)) return nullptr;
+  for (int i = 0; i < MAX_POLICY_CLIENTS; i++)
+    if (policies[i].used && macEq(policies[i].mac, mac)) return &policies[i];
+  return nullptr;
+}
+static ClientPolicy* findOrCreatePolicy(const uint8_t* mac) {
+  ClientPolicy* p = findPolicy(mac);
+  if (p || !mac || macIsZero(mac)) return p;
+  for (int i = 0; i < MAX_POLICY_CLIENTS; i++)
+    if (!policies[i].used) {
+      policies[i].used = true; memcpy(policies[i].mac, mac, 6);
+      policies[i].alias = ""; policies[i].ruleCount = 0;
+      return &policies[i];
+    }
+  return nullptr;  // table full: reject, never evict managed policies silently
+}
+static void savePolicies() {
+  File f = LittleFS.open("/clientpol.tmp", "w"); if (!f) return;
+  for (int i = 0; i < MAX_POLICY_CLIENTS; i++) {
+    if (!policies[i].used) continue;
+    f.print(macStr(policies[i].mac)); f.print('|'); f.print(policies[i].alias); f.print('|');
+    for (int j = 0; j < policies[i].ruleCount; j++) { if (j) f.print(','); f.print(policies[i].rule[j]); }
+    f.println();
+  }
+  f.close();
+  LittleFS.remove("/clientpol.txt");
+  LittleFS.rename("/clientpol.tmp", "/clientpol.txt");
+}
+static void loadPolicies() {
+  for (int i = 0; i < MAX_POLICY_CLIENTS; i++) { policies[i].used = false; policies[i].alias = ""; policies[i].ruleCount = 0; }
+  File f = LittleFS.open("/clientpol.txt", "r"); if (!f) return;
+  int slot = 0;
+  while (f.available() && slot < MAX_POLICY_CLIENTS) {
+    String line = f.readStringUntil('\n');
+    if (line.length() > 2048) continue;  // corrupt/oversized line: skip, never crash
+    int p1 = line.indexOf('|'); int p2 = line.indexOf('|', p1 + 1);
+    if (p1 < 0 || p2 < 0) continue;
+    String macS = line.substring(0, p1); String alias = line.substring(p1 + 1, p2); String rules = line.substring(p2 + 1);
+    uint8_t mac[6];
+    if (!parseMac(macS, mac) || macIsZero(mac)) continue;
+    if (!isValidAlias(alias)) continue;
+    if (findPolicy(mac)) continue;  // duplicate MAC in file: keep first
+    ClientPolicy* p = findOrCreatePolicy(mac);
+    if (!p) break;
+    p->alias = alias;
+    int start = 0;
+    while (start <= rules.length() && p->ruleCount < MAX_RULES_PER_CLIENT) {
+      int c = rules.indexOf(',', start);
+      String d = (c < 0 ? rules.substring(start) : rules.substring(start, c));
+      d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
+      bool dup = false;
+      for (int k = 0; k < p->ruleCount; k++) if (p->rule[k] == d) { dup = true; break; }
+      if (!dup && pcIsValidDomain(d)) {
+        p->rule[p->ruleCount] = d; p->ruleHash[p->ruleCount] = fnv40(d.c_str(), d.length()); p->ruleCount++;
+      } else if (!dup && d.length() == 0) {
+        // trailing comma: nothing to add
+      }
+      // invalid entries are skipped individually; the rest of the line still loads
+      if (c < 0) break;
+      start = c + 1;
+    }
+    slot++;
+  }
+  f.close();
+}
+static bool setClientAlias(const String& macS, String alias) {
+  uint8_t mac[6];
+  if (!parseMac(macS, mac) || macIsZero(mac)) return false;
+  alias.trim();
+  if (!isValidAlias(alias)) return false;
+  ClientPolicy* p = findOrCreatePolicy(mac);
+  if (!p) return false;
+  p->alias = alias; savePolicies(); return true;
+}
+static bool addClientRule(String macS, String d) {
+  uint8_t mac[6]; macS.trim();
+  if (!parseMac(macS, mac) || macIsZero(mac)) return false;
+  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
+  if (!pcIsValidDomain(d)) return false;
+  ClientPolicy* p = findOrCreatePolicy(mac);
+  if (!p || p->ruleCount >= MAX_RULES_PER_CLIENT) return false;
+  for (int i = 0; i < p->ruleCount; i++) if (p->rule[i] == d) return false;
+  p->rule[p->ruleCount] = d; p->ruleHash[p->ruleCount] = fnv40(d.c_str(), d.length()); p->ruleCount++;
+  savePolicies(); return true;
+}
+static bool removeClientRule(const String& macS, String d) {
+  uint8_t mac[6];
+  if (!parseMac(macS, mac) || macIsZero(mac)) return false;
+  d.trim(); d.toLowerCase();
+  ClientPolicy* p = findPolicy(mac);
+  if (!p) return false;
+  for (int i = 0; i < p->ruleCount; i++) if (p->rule[i] == d) {
+    for (int j = i; j < p->ruleCount - 1; j++) { p->rule[j] = p->rule[j + 1]; p->ruleHash[j] = p->ruleHash[j + 1]; }
+    p->ruleCount--; savePolicies(); return true;
+  }
+  return false;
+}
+// Same suffix-walk semantics as isBlocked(): rule tiktok.com matches
+// tiktok.com and www/api/m.tiktok.com, but never notiktok.com (hash differs
+// and the walk only strips at dot boundaries). Only this client's small rule
+// set is scanned, so there is no clients x rules scan per query.
+static bool isBlockedForClient(const uint8_t* mac, const char* domain) {
+  ClientPolicy* p = findPolicy(mac);
+  if (!p || p->ruleCount == 0) return false;
+  const char* q = domain;
+  while (q && *q) {
+    uint64_t h = fnv40(q, strlen(q));
+    for (int i = 0; i < p->ruleCount; i++) if (p->ruleHash[i] == h) return true;
+    const char* dot = strchr(q, '.'); if (!dot) break;
+    const char* next = dot + 1; if (!strchr(next, '.')) break; q = next;
+  }
+  return false;
+}
+#endif  // ENABLE_PER_CLIENT_RULES
 static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
 static void loadBanned() {
   numBanned = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
@@ -214,7 +404,16 @@ static void getMac(uint32_t ip, uint8_t* mac) {
     if (etharp_find_addr(nif, &ipa, &eth, &ipret) >= 0 && eth) { memcpy(mac, eth->addr, 6); return; }
 }
 static Dev* getClient(uint32_t ip) {
-  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
+  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) {
+    clients[i].lastSeen = millis();
+#if ENABLE_PER_CLIENT_RULES
+    // ARP may have resolved after entry creation: fill in a previously
+    // unknown MAC so per-client policy starts applying. Never overwrites
+    // a known MAC.
+    if (macIsZero(clients[i].mac)) getMac(ip, clients[i].mac);
+#endif
+    return &clients[i];
+  }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
     c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
@@ -283,6 +482,11 @@ static bool handleDns() {
     Dev* c = getClient((uint32_t)cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
+#if ENABLE_PER_CLIENT_RULES
+    // Hierarchy: ban -> per-client rule -> global (custom + blocklist) -> forward.
+    // No numHashes guard here: custom/client rules must work with an empty blocklist.
+    if (blockingOn && !blocked) blocked = isBlockedForClient(c ? c->mac : nullptr, domain);
+#endif
     int rlen;
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
@@ -327,9 +531,19 @@ static void handleStats() {
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
+#if ENABLE_PER_CLIENT_RULES
+             ",\"perclient\":true" +
+#endif
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false");
+#if ENABLE_PER_CLIENT_RULES
+    { ClientPolicy* pol = findPolicy(c.mac);
+      j += ",\"alias\":\"" + jesc(pol ? pol->alias : String("")) + "\",\"rules\":[";
+      if (pol) for (int k = 0; k < pol->ruleCount; k++) { j += (k ? "," : ""); j += "\"" + jesc(pol->rule[k]) + "\""; }
+      j += "]"; }
+#endif
+    j += "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
@@ -361,6 +575,28 @@ static void handleBan() {
   IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
   web.send(200, "text/plain", "ok");
 }
+#if ENABLE_PER_CLIENT_RULES
+// Per-client policy endpoints. Same auth model as /ban and /addblock.
+static void handleSetAlias() {
+  if (!requireAuth()) return;
+  String mac = web.arg("mac"); mac.trim();
+  String alias = web.arg("alias");
+  if (!setClientAlias(mac, alias)) { web.send(400, "text/plain", "invalid mac or alias"); return; }
+  web.send(200, "text/plain", "ok");
+}
+static void handleAddClientBlock() {
+  if (!requireAuth()) return;
+  String mac = web.arg("mac"); String d = web.arg("d");
+  if (d.length() > 253 || !addClientRule(mac, d)) { web.send(400, "text/plain", "invalid mac or domain"); return; }
+  web.send(200, "text/plain", "ok");
+}
+static void handleUnClientBlock() {
+  if (!requireAuth()) return;
+  String mac = web.arg("mac"); String d = web.arg("d"); d.trim(); d.toLowerCase();
+  if (d.length() > 253 || pcHasControlChars(d) || !removeClientRule(mac, d)) { web.send(400, "text/plain", "invalid mac or domain"); return; }
+  web.send(200, "text/plain", "ok");
+}
+#endif
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
 // The partition holds one list, so we free the old one before writing the new.
@@ -575,7 +811,11 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadCustom(); loadBanned(); loadUpdateCfg();
+  loadCustom(); loadBanned();
+#if ENABLE_PER_CLIENT_RULES
+  loadPolicies();
+#endif
+  loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -603,6 +843,11 @@ void setup() {
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
+#if ENABLE_PER_CLIENT_RULES
+  web.on("/setalias", handleSetAlias);
+  web.on("/addclientblock", handleAddClientBlock);
+  web.on("/unclientblock", handleUnClientBlock);
+#endif
   web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
