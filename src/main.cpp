@@ -439,14 +439,17 @@ static void reopenBlocklist() {
 
   if (!count) {
     // Live list is absent or invalid: repair an interrupted swap. Drop the bad
-    // live file, then try the previous list then a verified-but-unpromoted one.
+    // live file, then try the previous list, then a verified-but-unpromoted one.
+    // /blocklist.old was a live list, so it may predate the container (legacy).
+    // /blocklist.new is a staging file this firmware wrote, so it must be v1.
     if (blocklist) blocklist.close();
     LittleFS.remove(BLOCKLIST_PATH);
-    const char* recover[] = { BLOCKLIST_OLD, BLOCKLIST_NEW };
+    const char* recover[]       = { BLOCKLIST_OLD, BLOCKLIST_NEW };
+    const bool  recoverLegacy[] = { true,          false };
     for (int i = 0; i < 2 && !count; i++) {
       if (!LittleFS.exists(recover[i]) || !LittleFS.rename(recover[i], BLOCKLIST_PATH)) continue;
       blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-      count = blocklist ? validBlocklist(blocklist, true, blocklistOffset, legacy) : 0;
+      count = blocklist ? validBlocklist(blocklist, recoverLegacy[i], blocklistOffset, legacy) : 0;
       if (count) Serial.printf("blocklist: recovered %s after an interrupted swap\n", recover[i]);
       else { if (blocklist) blocklist.close(); LittleFS.remove(BLOCKLIST_PATH); }
     }
@@ -454,6 +457,7 @@ static void reopenBlocklist() {
 
   if (!count) { if (blocklist) blocklist.close(); Serial.println("blocklist: none/invalid on flash -> no blocking"); return; }
   LittleFS.remove(BLOCKLIST_OLD);                 // swap finished; nothing left to recover
+  LittleFS.remove(BLOCKLIST_NEW);                 // stale staging file, if any
   numHashes = count;
   buildFlashIndex();
   if (legacy) Serial.printf("blocklist: %u domains (LEGACY raw format; rebuild or update to the v1 container)\n", numHashes);

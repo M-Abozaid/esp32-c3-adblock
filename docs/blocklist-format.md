@@ -95,6 +95,10 @@ python3 tools/build_blocklist.py --format raw data/blocklist.bin
   `/blocklist.old` until the new one is live. A bad or interrupted transfer keeps the
   old list. Boot repairs a swap interrupted by a power loss: it uses a valid live
   list, else restores `/blocklist.old`, else promotes a verified `/blocklist.new`.
+  `/blocklist.old` was a live list and may be a pre-container file, so legacy is
+  allowed there. `/blocklist.new` is a staging file this firmware wrote, so it must be
+  a v1 container. Boot removes a stale `/blocklist.old` and `/blocklist.new` once a
+  list loads.
 - The transfer needs room for two lists at once (old + new). A list near the maximum
   size may not fit; the update then fails and the old list stays.
 
