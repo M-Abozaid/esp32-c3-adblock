@@ -233,11 +233,20 @@ static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype
   if (o > 4 && strncmp(out, "www.", 4) == 0) { memmove(out, out + 4, o - 3); o -= 4; }
   return o;
 }
+static const uint16_t QTYPE_A = 1;
+static const uint16_t QTYPE_AAAA = 28;
+static const uint16_t QCLASS_IN = 1;
 static int buildBlocked(int qend, uint16_t qtype) {
-  buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == 1) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
-  if (qtype != 1) return qend;
-  const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
-  memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == QTYPE_A || qtype == QTYPE_AAAA) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
+  if (qtype == QTYPE_A) {
+    const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
+    memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  }
+  if (qtype == QTYPE_AAAA) {
+    const uint8_t ans[] = {0xC0,0x0C, 0,28, 0,1, 0,0,1,0x2C, 0,16, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+  }
+  return qend;
 }
 // Forward to upstream and wait for the reply that actually belongs to THIS query.
 // Issue #10: after one timeout the late reply used to sit in the socket and get relayed
@@ -277,12 +286,23 @@ static bool handleDns() {
     int sz = dnsServer.parsePacket(); if (sz <= 0) break;
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 12) continue;
+    // Validate header: must be a standard query with exactly one question.
+    // EDNS OPT records live past qend and are forwarded untouched; blocked
+    // replies strip them (see buildBlocked) to stay well-formed.
+    uint16_t qdcount = (buf[4] << 8) | buf[5];
+    bool isQuery = (buf[2] & 0x80) == 0;
+    uint8_t opcode = (buf[2] >> 3) & 0x0F;
+    if (!isQuery || opcode != 0 || qdcount != 1) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+    if (!dl) continue;  // malformed: drop instead of forwarding upstream
+    // Require QCLASS IN (1); drop CHAOS/Hesiod and other classes.
+    uint16_t qclass = (buf[qend - 2] << 8) | buf[qend - 1];
+    if (qclass != QCLASS_IN) continue;
     Dev* c = getClient((uint32_t)cip);
     bool ban = c && c->banned;
-    bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
+    bool blocked = ban || (blockingOn && numHashes && isBlocked(domain));
     int rlen;
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
