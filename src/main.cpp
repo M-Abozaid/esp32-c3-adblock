@@ -17,6 +17,7 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "hardware/hardware.h"  // observability only; DNS never depends on it
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
@@ -568,6 +569,7 @@ static void startConfigPortal() {
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
+  hwBegin();  // no-op without a display; never blocks core services
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
@@ -581,6 +583,8 @@ void setup() {
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
 #if CONFIG_IDF_TARGET_ESP32C3
   const int BOOT_PIN = 9;     // C3 BOOT button
+#elif defined(LILYGO_T_DISPLAY_S3)
+  const int BOOT_PIN = 0;     // T-Display-S3 Button 1
 #else
   const int BOOT_PIN = 0;     // classic ESP32 BOOT button (GPIO9 is a flash pin there)
 #endif
@@ -640,5 +644,30 @@ void loop() {
     if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
     else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
   }
+#ifdef LILYGO_T_DISPLAY_S3
+  {  // Observability snapshot, S3 builds only, throttled: the display layer
+     // redraws at most every 1.5s, and nothing here runs on C3/ESP32 builds.
+    static uint32_t lastHwMs = 0;
+    uint32_t nowHw = millis();
+    if (nowHw - lastHwMs >= 1500) {
+      lastHwMs = nowHw;
+      HwStatus st;
+      st.wifiConnected = WiFi.status() == WL_CONNECTED;
+      strncpy(st.ip, WiFi.localIP().toString().c_str(), sizeof(st.ip) - 1);
+      st.ip[sizeof(st.ip) - 1] = 0;
+      st.rssi = WiFi.RSSI();
+      st.dnsRunning = true;
+      st.blocked = totalBlocked;
+      st.allowed = totalAllowed;
+      st.clients = numClients;
+      st.blocklistReady = numHashes > 0;
+      st.domains = numHashes;
+      strncpy(st.update, updateStatus.c_str(), sizeof(st.update) - 1);
+      st.update[sizeof(st.update) - 1] = 0;
+      st.uptimeSec = nowHw / 1000;
+      hwTick(st);
+    }
+  }
+#endif
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
 }

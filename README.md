@@ -50,6 +50,47 @@ makes it undeniable.
 - A **USB-A → USB-C dongle** lets it plug straight into the spare USB port on the
   back of most routers — no power supply, no extra box.
 
+### LILYGO T-Display-S3
+
+Supported as an ESP32-S3 target with a 1.9" ST7789 status display:
+
+- MCU: ESP32-S3R8, 16 MB flash, 8 MB OPI PSRAM, Wi-Fi 2.4 GHz
+- Display: ST7789V 170×320 over an 8-bit parallel bus (D0–D7 GPIO39–42,45–48;
+  DC 7, CS 6, WR 8, RD 9, RST 5, backlight 38, power control 15)
+- Buttons: BOOT/GPIO0 (home) and GPIO14 (next page)
+- Battery voltage sense on GPIO4
+
+Build and flash:
+
+```bash
+pio run -e lilygo-t-display-s3
+pio run -e lilygo-t-display-s3 -t upload   # firmware via USB (first flash)
+```
+
+Initializing the blocklist (pick one; `data/` ships empty so `uploadfs`
+alone does not install a list):
+
+```bash
+# Option A — upload from the dashboard at http://c3adblock.local:
+python3 tools/build_blocklist.py blocklist.bin
+# then Blocklist Upload -> select blocklist.bin (authenticated)
+
+# Option B — let the device pull it over validated HTTPS:
+# paste the weekly release asset into Remote auto-update, e.g.
+# https://github.com/M-Abozaid/esp32-c3-adblock/releases/download/blocklist/blocklist.bin
+
+# Option C — bake it into the filesystem image before flashing it:
+python3 tools/build_blocklist.py data/blocklist.bin
+pio run -e lilygo-t-display-s3 -t uploadfs
+```
+
+The 16 MB partition table keeps dual OTA app slots (3 MB each) plus ~10 MB
+LittleFS for ~2M blocklist domains. The display is read-only observability
+(status, DNS, network, blocklist screens, switched with the buttons) and never
+blocks DNS; all administration stays in the authenticated web dashboard.
+Hostname stays `c3adblock.local` for compatibility. PSRAM is detected at boot
+and logged; the DNS critical path does not depend on it.
+
 ### Enclosure
 
 A printable case for the C3 SuperMini: [`hardware/esp32-c3-supermini-enclosure.stl`](hardware/esp32-c3-supermini-enclosure.stl)
