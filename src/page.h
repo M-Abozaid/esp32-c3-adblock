@@ -27,8 +27,15 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <select id=pausedur style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px"><option value=30>30s</option><option value=300 selected>5 min</option><option value=1800>30 min</option><option value=0>until I re-enable</option></select>
 <button id=pausebtn onclick=togglePause()>Pause</button></div>
 <div class=cards id=sys></div>
-<h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
-<h2>CUSTOM BLOCKED DOMAINS</h2>
+<h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th>Policy</th><th></th></tr></thead><tbody></tbody></table>
+<div id=manage style="display:none;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin:-8px 0 18px">
+<div style=margin-bottom:8px><b id=mTitle></b> <span style=color:#8b949e;font-size:12px>per-client rules affect only this client (MAC identity)</span>
+<span style=float:right><button onclick=closeManage()>Close</button></span></div>
+<div style=margin-bottom:8px>Alias: <input id=mAlias size=24 maxlength=32> <button onclick=saveAlias()>Save alias</button></div>
+<div style=margin-bottom:6px>Blocked domains:</div><table id=mt><tbody></tbody></table>
+<div style=margin-top:8px><input id=mDom placeholder="ads.example.com" size=30><button onclick=addClientDom()>Block for this client</button></div>
+</div>
+<h2>CUSTOM BLOCKED DOMAINS (GLOBAL &mdash; affects everyone)</h2>
 <div style=margin-bottom:8px><input id=dom placeholder="ads.example.com" size=30><button onclick=addDom()>Block domain</button></div>
 <table id=cl><tbody></tbody></table>
 <h2>BLOCKLIST &mdash; UPLOAD</h2>
@@ -38,6 +45,20 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
 <button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
+<h2>DNS QUERY LOGGING</h2>
+<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin-bottom:18px">
+<div style="color:#8b949e;font-size:12px;margin-bottom:8px">DNS Query Logging sends DNS query metadata to an external collector on your local network. The collector is optional. DNS resolution does not depend on the collector.</div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:10px">Logging records queried domains, not full HTTPS URLs or page contents.</div>
+<div style=margin-bottom:8px><label><input type=checkbox id=dlogen> Enable DNS Query Logging</label>
+<span style="margin-left:12px">Status: <b id=dlogstatus>&mdash;</b></span></div>
+<div style=margin-bottom:8px>Collector IP: <input id=dloghost placeholder="192.168.1.100" size=16 maxlength=64>
+UDP Port: <input id=dlogport size=6 value=40153>
+Mode: <select id=dlogmode style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px"><option value=OFF>Off</option><option value=BLOCKED_ONLY>Blocked only</option><option value=ALL>All queries</option></select>
+<button onclick=saveDnsLog()>Save</button> <span id=dlogmsg style=color:#8b949e></span></div>
+<div style="color:#8b949e;font-size:12px">Collector: <span id=dlogcoll>&mdash;</span> &middot;
+Last event dispatched: <span id=dloglast>&mdash;</span> &middot;
+Generated: <span id=dloggen>0</span> &middot; Dispatched: <span id=dlogsent>0</span> &middot; Dropped: <span id=dlogdrop>0</span></div>
+</div>
 <h2>FIRMWARE &mdash; OTA UPDATE</h2>
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
@@ -51,6 +72,7 @@ function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
 // though the server can't otherwise tell a forged request from a real one over
 // plain HTTP Basic Auth (browsers auto-replay cached Basic Auth cross-origin).
 const CSRF_HDRS={'X-Requested-With':'c3-adblock'}
+let selMac='';
 function togglePause(){fetch(blockstate.dataset.on=='1'?'/pause?s='+pausedur.value:'/resume',{headers:CSRF_HDRS}).then(load);}
 async function load(){let s=await(await fetch('/stats.json')).json();
 host.textContent='@ '+s.ip;
@@ -62,18 +84,41 @@ pausebtn.textContent=on?'Pause':'Resume';pausedur.style.display=on?'':'none';
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
 ['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
-ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
-<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>{
+let name=c.alias?`${esc(c.alias)} <span class=tag>${esc(c.ip)}</span>`:esc(c.ip);
+if(c.banned)name+=' <span class=tag style=color:#f85149>BANNED</span>';
+let pol=(c.rules&&c.rules.length)?c.rules.length+' domain'+(c.rules.length>1?'s':''):'&mdash;';
+return `<tr><td>${name}</td><td>${esc(c.mac)}</td>
+<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td><td>${pol}</td>
+<td style=white-space:nowrap><button class=mng data-mac="${esc(c.mac)}">Manage</button> <button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button></td></tr>`}).join('');
+if(selMac){let m=s.clients.find(x=>x.mac==selMac);if(m)renderManage(m);}
 cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-ustat.textContent=s.upstat||'—';}
+ustat.textContent=s.upstat||'—';
+let dl=s.dnslog||{};
+if(document.activeElement!=dlogen)dlogen.checked=!!dl.enabled;
+if(document.activeElement!=dloghost)dloghost.value=dl.host||'';
+if(document.activeElement!=dlogport)dlogport.value=dl.port||40153;
+if(document.activeElement!=dlogmode)dlogmode.value=dl.mode||'OFF';
+dlogstatus.textContent=dl.active?'ENABLED':'DISABLED';
+dlogcoll.textContent=dl.host?(dl.host+':'+(dl.port||40153)):'not configured';
+dloglast.textContent=dl.last?new Date(dl.last*1000).toLocaleString():'—';
+dloggen.textContent=fmt(dl.generated||0);dlogsent.textContent=fmt(dl.dispatched||0);dlogdrop.textContent=fmt(dl.dropped||0);}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{dom.value='';load()})}}
+function renderManage(m){mTitle.innerHTML=`${m.alias?esc(m.alias)+' ':''}<span style=color:#8b949e;font-size:12px>${esc(m.ip)} · ${esc(m.mac)}</span>`;
+if(document.activeElement!=mAlias)mAlias.value=m.alias||'';
+mt.tBodies[0].innerHTML=(m.rules||[]).map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=crmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet — global blocklist still applies</td></tr>';}
+function manageClient(mac){selMac=mac;manage.style.display='block';load()}
+function closeManage(){selMac='';manage.style.display='none'}
+function saveAlias(){if(!selMac)return;fetch('/setalias?mac='+encodeURIComponent(selMac)+'&alias='+encodeURIComponent(mAlias.value.trim()),{headers:CSRF_HDRS}).then(load)}
+function addClientDom(){let d=mDom.value.trim();if(d&&selMac){fetch('/addclientblock?mac='+encodeURIComponent(selMac)+'&d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{mDom.value='';load()})}}
 ct.addEventListener('click',e=>{if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
+ct.addEventListener('click',e=>{if(e.target.classList.contains('mng'))manageClient(e.target.dataset.mac)});
+mt.addEventListener('click',e=>{if(e.target.classList.contains('crmbtn')&&selMac)fetch('/unclientblock?mac='+encodeURIComponent(selMac)+'&d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
 cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unblock?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
 function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:CSRF_HDRS}).then(load)}
+function saveDnsLog(){dlogmsg.textContent='saving...';fetch('/setdnslog?enabled='+(dlogen.checked?'1':'0')+'&host='+encodeURIComponent(dloghost.value.trim())+'&port='+encodeURIComponent(dlogport.value)+'&mode='+encodeURIComponent(dlogmode.value),{headers:CSRF_HDRS}).then(async r=>{dlogmsg.textContent=r.ok?'✓ saved':'✗ '+await r.text();load()})}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
 function forgetWifi(){fetch('/forgetwifi',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>alert(t))}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';

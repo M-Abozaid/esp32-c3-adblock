@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        env: [c3, esp32dev]
+        env: [c3, esp32dev, lilygo-t-display-s3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,4 +37,12 @@ jobs:
         run: |
           printf '||ads.example.com^\n@@||ok.example.org^\n||ok.example.org^\n0.0.0.0 hosts.example.com\nplain.example.com\n/^regex$/\n' > t.txt
           python3 tools/build_blocklist.py t.bin t.txt
-          test "$(stat -c%s t.bin)" -eq 15   # 3 entries x 5 bytes
+          python3 - <<'PY'
+          import struct
+          d = open('t.bin','rb').read()
+          assert d[0:4] == b'CADB'
+          ver, hb, res, cnt, crc = struct.unpack('<HBBII', d[4:16])
+          assert ver == 1 and hb == 5 and cnt == 3, f'unexpected header {ver} {hb} {cnt}'
+          assert len(d) == 16 + 3 * 5
+          print('blocklist tool OK: 3 entries with v1 header')
+          PY
