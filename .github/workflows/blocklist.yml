@@ -19,10 +19,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build default blocklist in both formats (fails if any source is unreachable)
+      - name: Build default blocklist (fails if any source is unreachable)
         run: |
-          python3 tools/build_blocklist.py --format v1  blocklist-v1.bin 2>&1 | tee build.log
-          python3 tools/build_blocklist.py --format raw blocklist.bin    2>&1 | tee -a build.log
+          python3 tools/build_blocklist.py --format v1 blocklist-v1.bin 2>&1 | tee build.log
+          tail -c +17 blocklist-v1.bin > blocklist.bin   # legacy raw = same snapshot's payload
       - name: Sanity checks
         run: |
           size1=$(stat -c%s blocklist-v1.bin); sizer=$(stat -c%s blocklist.bin)

@@ -402,6 +402,7 @@ static uint32_t validBlocklist(File& f, bool allowLegacy, uint32_t& dataOffset, 
   }
   if (hdr[4] != BL_VERSION) return 0;                 // a container of a version we don't know
   if (hdr[5] != HASH_BYTES) return 0;                 // built for a different hash width
+  if (hdr[6] != 0 || hdr[7] != 0) return 0;           // reserved must be zero (producer/CI/consumer agree)
   uint32_t count = (uint32_t)hdr[8]  | ((uint32_t)hdr[9]  << 8) | ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
   uint32_t want  = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) | ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
   if (count == 0) return 0;

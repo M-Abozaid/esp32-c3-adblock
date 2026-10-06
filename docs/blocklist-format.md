@@ -40,9 +40,10 @@ The firmware accepts a file only when all rules hold:
 2. Bytes 0..3 equal `C3BL`.
 3. Byte 4 equals 1.
 4. Byte 5 equals `HASH_BYTES`.
-5. The entry count is not zero.
-6. The file size equals `16 + count * hash_bytes`. Trailing data is an error.
-7. The payload CRC32 equals the header CRC32.
+5. Bytes 6..7 (reserved) equal 0.
+6. The entry count is not zero.
+7. The file size equals `16 + count * hash_bytes`. Trailing data is an error.
+8. The payload CRC32 equals the header CRC32.
 
 The firmware checks the CRC when it commits an upload or a remote fetch. It checks
 the CRC again when it loads the file at boot.
