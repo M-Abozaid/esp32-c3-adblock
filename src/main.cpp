@@ -30,6 +30,8 @@
 static const IPAddress UPSTREAM(UPSTREAM_IP);
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
+static const char* BLOCKLIST_NEW  = "/blocklist.new";   // pending list, verified before promote
+static const char* BLOCKLIST_OLD  = "/blocklist.old";   // previous list kept during a crash-safe swap
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 static const int INDEX_ENTRIES = 4096;   // 20 KB first-level flash index
@@ -423,22 +425,35 @@ static uint32_t validBlocklist(File& f, bool allowLegacy, uint32_t& dataOffset, 
 }
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// A new list lands in /blocklist.new first. We verify it and only then replace the
-// live list, so a bad or interrupted transfer never costs us the working one. The
-// live list stays loaded and blocking during the transfer. Peak flash use is
-// old + new, so the list must leave that much headroom in the LittleFS partition.
+// A new list lands in /blocklist.new first. We verify it and only then promote it,
+// so a bad or interrupted transfer never costs us the working list. Promotion is a
+// two-step rename (live -> /blocklist.old, then new -> live) and boot repairs an
+// interrupted swap, so the update is crash-safe. Renames do not copy, so peak flash
+// use is still old + new: the list must leave that headroom in the LittleFS partition.
 static void reopenBlocklist() {
   if (blocklist) blocklist.close();
   blocklistOffset = 0; numHashes = 0;
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (!blocklist) { Serial.println("blocklist: none on flash"); return; }
   bool legacy = false;
-  uint32_t count = validBlocklist(blocklist, true, blocklistOffset, legacy);
+  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+  uint32_t count = blocklist ? validBlocklist(blocklist, true, blocklistOffset, legacy) : 0;
+
   if (!count) {
-    Serial.println("blocklist: invalid data -> not loaded (upload or fetch a new blocklist)");
-    blocklist.close();
-    return;
+    // Live list is absent or invalid: repair an interrupted swap. Drop the bad
+    // live file, then try the previous list then a verified-but-unpromoted one.
+    if (blocklist) blocklist.close();
+    LittleFS.remove(BLOCKLIST_PATH);
+    const char* recover[] = { BLOCKLIST_OLD, BLOCKLIST_NEW };
+    for (int i = 0; i < 2 && !count; i++) {
+      if (!LittleFS.exists(recover[i]) || !LittleFS.rename(recover[i], BLOCKLIST_PATH)) continue;
+      blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+      count = blocklist ? validBlocklist(blocklist, true, blocklistOffset, legacy) : 0;
+      if (count) Serial.printf("blocklist: recovered %s after an interrupted swap\n", recover[i]);
+      else { if (blocklist) blocklist.close(); LittleFS.remove(BLOCKLIST_PATH); }
+    }
   }
+
+  if (!count) { if (blocklist) blocklist.close(); Serial.println("blocklist: none/invalid on flash -> no blocking"); return; }
+  LittleFS.remove(BLOCKLIST_OLD);                 // swap finished; nothing left to recover
   numHashes = count;
   buildFlashIndex();
   if (legacy) Serial.printf("blocklist: %u domains (LEGACY raw format; rebuild or update to the v1 container)\n", numHashes);
@@ -446,18 +461,29 @@ static void reopenBlocklist() {
 }
 static void beginBlocklistSwap() {
   // Leave the live list untouched; only clear a stale temp file.
-  LittleFS.remove("/blocklist.new");
+  LittleFS.remove(BLOCKLIST_NEW);
 }
 static bool commitNewBlocklist(bool allowLegacy) {   // /blocklist.new -> live (validated)
-  File f = LittleFS.open("/blocklist.new", "r");
+  File f = LittleFS.open(BLOCKLIST_NEW, "r");
   uint32_t off = 0; bool legacy = false;
   uint32_t count = validBlocklist(f, allowLegacy, off, legacy);
   if (f) f.close();
-  if (!count) { LittleFS.remove("/blocklist.new"); return false; }   // live list unchanged
-  // Promote only now: the old list survived the whole download.
+  if (!count) { LittleFS.remove(BLOCKLIST_NEW); return false; }   // live list unchanged
+  // Crash-safe promote: the old list stays on flash as /blocklist.old until the new
+  // one is live, so a power loss at any point is repaired by reopenBlocklist().
   if (blocklist) blocklist.close();
-  LittleFS.remove(BLOCKLIST_PATH);
-  if (!LittleFS.rename("/blocklist.new", BLOCKLIST_PATH)) { reopenBlocklist(); return false; }
+  LittleFS.remove(BLOCKLIST_OLD);
+  if (LittleFS.rename(BLOCKLIST_PATH, BLOCKLIST_OLD)) {
+    if (!LittleFS.rename(BLOCKLIST_NEW, BLOCKLIST_PATH)) {   // promote failed -> roll back
+      LittleFS.rename(BLOCKLIST_OLD, BLOCKLIST_PATH);
+      reopenBlocklist();
+      return false;
+    }
+  } else if (!LittleFS.rename(BLOCKLIST_NEW, BLOCKLIST_PATH)) {  // no live list (first install)
+    reopenBlocklist();
+    return false;
+  }
+  LittleFS.remove(BLOCKLIST_OLD);
   // Already verified -> open and index without a second payload pass.
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   blocklistOffset = off;
@@ -482,7 +508,7 @@ static void handleUpload() {
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false; beginBlocklistSwap();
-      upFile = LittleFS.open("/blocklist.new", "w");
+      upFile = LittleFS.open(BLOCKLIST_NEW, "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
@@ -497,7 +523,7 @@ static void handleUpload() {
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new");           // live list was never touched
+      LittleFS.remove(BLOCKLIST_NEW);              // live list was never touched
       Serial.println("[ota] aborted");
       break;
   }
@@ -526,8 +552,8 @@ static bool fetchBlocklist(String url) {
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
   beginBlocklistSwap();
-  File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; LittleFS.remove("/blocklist.new"); return false; }
+  File f = LittleFS.open(BLOCKLIST_NEW, "w");
+  if (!f) { http.end(); updateStatus = "fs open failed"; LittleFS.remove(BLOCKLIST_NEW); return false; }
   WiFiClient* stream = http.getStreamPtr();
   int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
   while (http.connected() && (len < 0 || (int)total < len)) {
@@ -536,8 +562,8 @@ static bool fetchBlocklist(String url) {
     else { if (millis() - idle > 15000) break; delay(2); }
   }
   f.close(); http.end();
-  bool ok = commitNewBlocklist(true);              // remote may serve legacy raw (migration)
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+  bool ok = commitNewBlocklist(false);             // remote must serve a v1 container
+  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("not a v1 container (" + String(total) + "B)");
   Serial.printf("[remote] %s\n", updateStatus.c_str());
   return ok;
 }

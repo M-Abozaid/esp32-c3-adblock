@@ -48,9 +48,9 @@ The firmware accepts a file only when all rules hold:
 The firmware checks the CRC when it commits an upload or a remote fetch. It checks
 the CRC again when it loads the file at boot.
 
-The firmware also accepts a legacy raw file (no header) when it has to keep working:
-at boot, and for a remote fetch during migration. It reads the count as
-`size / hash_bytes` and prints a warning. Upload rejects a raw file. See
+The firmware also accepts a legacy raw file (no header) at boot only. It reads the
+count as `size / hash_bytes` and prints a warning. This keeps the list working across
+a firmware upgrade. Upload and remote fetch accept a v1 container only. See
 Compatibility below.
 
 If no list is valid, the firmware loads no list. The device then forwards all
@@ -87,16 +87,16 @@ python3 tools/build_blocklist.py --format raw data/blocklist.bin
 
 ## Compatibility
 
-- The firmware loads a v1 container. It also loads a legacy raw file in read-only
-  mode and prints a warning. An on-flash raw list keeps blocking across a firmware
-  upgrade.
-- Upload accepts a v1 container only. A raw upload is rejected.
-- Remote auto-update accepts both a v1 container and a legacy raw file. The raw path
-  exists only for migration and will be removed in a later release.
+- The firmware loads a v1 container. At boot it also loads a legacy raw file in
+  read-only mode and prints a warning. An on-flash raw list keeps blocking across a
+  firmware upgrade. Upload and remote update do not accept a raw file.
 - The firmware keeps the live list until a new file is fully received and verified.
-  A bad or interrupted transfer keeps the old list. The transfer needs room for two
-  lists at once (old + new). A list near the maximum size may not fit; the update
-  then fails and the old list stays.
+  It then promotes the new file with two renames and keeps the old one as
+  `/blocklist.old` until the new one is live. A bad or interrupted transfer keeps the
+  old list. Boot repairs a swap interrupted by a power loss: it uses a valid live
+  list, else restores `/blocklist.old`, else promotes a verified `/blocklist.new`.
+- The transfer needs room for two lists at once (old + new). A list near the maximum
+  size may not fit; the update then fails and the old list stays.
 
 To move a device to the current format, upload a v1 file or point Remote auto-update
 at `blocklist-v1.bin`:
