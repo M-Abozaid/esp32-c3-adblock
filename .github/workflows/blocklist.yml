@@ -25,14 +25,23 @@ jobs:
         run: |
           size=$(stat -c%s blocklist.bin)
           echo "size=$size bytes"
-          test $((size % 5)) -eq 0                  # whole 40-bit entries
-          test "$size" -gt 250000                   # >50k entries, catches a silently shrunk list
-          test "$size" -lt 1300000                  # fits the dual-OTA filesystem partition
+          test "$(head -c4 blocklist.bin)" = "C3BL"   # versioned container magic
+          test "$size" -gt 250016                     # >50k entries + 16-byte header
+          test "$size" -lt 1300000                    # fits the dual-OTA filesystem partition
+          python3 - <<'PY'
+          import struct, zlib
+          d = open('blocklist.bin', 'rb').read()
+          ver, hb, resv, count, crc = struct.unpack('<BBHII', d[4:16])
+          assert (ver, hb, resv) == (1, 5, 0), (ver, hb, resv)
+          assert len(d) == 16 + count * hb, 'size mismatch'
+          assert zlib.crc32(d[16:]) & 0xffffffff == crc, 'CRC mismatch'
+          print(f'{count:,} entries, CRC OK')
+          PY
       - name: Publish to the 'blocklist' release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          entries=$(( $(stat -c%s blocklist.bin) / 5 ))
+          entries=$(( ($(stat -c%s blocklist.bin) - 16) / 5 ))
           notes="Auto-built $(date -u +%F) — ${entries} entries (StevenBlack base + Hagezi Light).
 
           Set this as the device's Remote auto-update URL:

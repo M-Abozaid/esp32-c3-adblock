@@ -10,6 +10,11 @@ The trick everyone misses: you don't need to keep the blocklist in RAM. Store th
 domains as **sorted 40-bit hashes in flash** and binary-search them. 140,000+ domains
 fit in ~0.7 MB of flash and are matched in ~10 ms, using **~50 KB of RAM**.
 
+The file is a small versioned container: a 16-byte header (magic `C3BL`, format
+version, hash width, entry count, CRC32) followed by the sorted hashes. The firmware
+rejects any file without a valid header and CRC, so a random blob or an old-format
+file never loads. See [`docs/blocklist-format.md`](docs/blocklist-format.md).
+
 ```
 query in ──▶ extract domain ──▶ FNV-1a hash (+ parent suffixes)
          ──▶ binary-search the flash hash table
@@ -107,6 +112,12 @@ wildcards, `$` modifiers, cosmetic `##` rules) are skipped and counted. An `@@` 
 un-blocks that exact entry — it can't carve a subdomain out of a blocked parent. If a source
 can't be downloaded the build stops instead of silently producing a smaller list
 (`--allow-missing` to override).
+
+The output is a versioned container (16-byte header + payload). The firmware validates the
+header and the payload CRC32 before it loads the list, so a random file is rejected. The
+format is documented in [`docs/blocklist-format.md`](docs/blocklist-format.md). Note: after
+a firmware upgrade that adds the container, an on-device raw `blocklist.bin` is no longer
+loaded — rebuild it (`pio run -t uploadfs`) or re-upload it once.
 
 ### WiFi setup (no re-flash needed)
 

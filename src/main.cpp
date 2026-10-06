@@ -36,10 +36,28 @@ static const int INDEX_ENTRIES = 4096;   // 20 KB first-level flash index
 static const int CACHE_SIZE = 256;       // must be power of 2
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
 
+// Blocklist container (see tools/build_blocklist.py and docs/blocklist-format.md).
+// The payload is unchanged (sorted HASH_BYTES hashes), but a fixed header now
+// carries a version and a CRC32 so the firmware can reject a random blob and the
+// format can change later without mixing old and new .bin files.
+//   offset size field
+//   0      4    magic 'C3BL'
+//   4      1    format version
+//   5      1    hash bytes (must equal HASH_BYTES)
+//   6      2    reserved (0)
+//   8      4    entry count (LE)
+//   12     4    CRC32 of the payload (LE)
+//   16     n*HB payload
+static const uint8_t  BL_MAGIC[4]     = {'C', '3', 'B', 'L'};
+static const uint8_t  BL_VERSION      = 1;
+static const uint32_t BL_HEADER_SIZE  = 16;
+
+
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
 File blocklist;
+uint32_t blocklistOffset = 0;   // first payload byte in the file (BL_HEADER_SIZE once validated)
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
 uint8_t buf[1536];   // fits any non-fragmented UDP reply (EDNS answers can exceed 512)
 
@@ -94,7 +112,7 @@ static void buildFlashIndex() {
   if (!blocklist || numHashes == 0) return;
   for (int i = 0; i < INDEX_ENTRIES; i++) {
     uint32_t pos = (uint32_t)((uint64_t)i * (numHashes - 1) / (INDEX_ENTRIES - 1));
-    blocklist.seek((uint32_t)pos * HASH_BYTES);
+    blocklist.seek(blocklistOffset + (uint32_t)pos * HASH_BYTES);
     blocklist.read(blIndex[i], HASH_BYTES);
   }
   for (int i = 0; i < CACHE_SIZE; i++) cacheValid[i] = 0;
@@ -126,7 +144,7 @@ static bool inFlash(uint64_t h) {
   uint32_t rangeCount = endPos - startPos + 1;
   if (rangeCount > (uint32_t)MAX_RANGE) rangeCount = MAX_RANGE;
 
-  blocklist.seek((uint32_t)startPos * HASH_BYTES);
+  blocklist.seek(blocklistOffset + (uint32_t)startPos * HASH_BYTES);
   blocklist.read(rangeBuf, (uint32_t)rangeCount * HASH_BYTES);
 
   for (uint32_t i = 0; i < rangeCount; i++) {
@@ -342,28 +360,92 @@ static void handleBan() {
   web.send(200, "text/plain", "ok");
 }
 
+// ---------- blocklist validation ----------
+// CRC-32 (IEEE 802.3, reflected) -- matches Python zlib.crc32. Nibble table so the
+// whole routine stays a few dozen bytes of flash. Covers the payload only.
+static uint32_t crc32Update(uint32_t crc, const uint8_t* p, size_t n) {
+  static uint32_t tab[16];
+  static bool init = false;
+  if (!init) {
+    for (uint32_t i = 0; i < 16; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 4; k++) c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1)));
+      tab[i] = c;
+    }
+    init = true;
+  }
+  crc = ~crc;
+  while (n--) { crc ^= *p++; crc = (crc >> 4) ^ tab[crc & 0xF]; crc = (crc >> 4) ^ tab[crc & 0xF]; }
+  return ~crc;
+}
+
+// Parse and fully verify an open blocklist container. Returns the entry count,
+// or 0 if the file is not a valid container (wrong magic, unknown version,
+// hash-width mismatch, truncated, or CRC mismatch). Reads the payload once.
+static uint32_t validBlocklist(File& f) {
+  if (!f || f.size() < BL_HEADER_SIZE) return 0;
+  uint8_t hdr[BL_HEADER_SIZE];
+  f.seek(0);
+  if (f.read(hdr, BL_HEADER_SIZE) != BL_HEADER_SIZE) return 0;
+  if (memcmp(hdr, BL_MAGIC, 4) != 0) return 0;          // not a container (e.g. an old raw .bin)
+  if (hdr[4] != BL_VERSION) return 0;                   // version we don't know
+  if (hdr[5] != HASH_BYTES) return 0;                   // built for a different hash width
+  uint32_t count = (uint32_t)hdr[8]  | ((uint32_t)hdr[9]  << 8) | ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
+  uint32_t want  = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) | ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
+  if (count == 0) return 0;
+  uint64_t payload = (uint64_t)count * HASH_BYTES;
+  if ((uint64_t)BL_HEADER_SIZE + payload != (uint64_t)f.size()) return 0;   // extra/trailing data -> reject
+  f.seek(BL_HEADER_SIZE);
+  uint32_t crc = 0, left = (uint32_t)payload; uint8_t chunk[512];
+  while (left) {
+    size_t want_n = left > sizeof(chunk) ? sizeof(chunk) : left;
+    size_t n = f.read(chunk, want_n);
+    if (n != want_n) return 0;
+    crc = crc32Update(crc, chunk, n);
+    left -= n;
+  }
+  if (crc != want) return 0;
+  return count;
+}
+
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
 // The partition holds one list, so we free the old one before writing the new.
 // While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
 static void reopenBlocklist() {
+  if (blocklist) blocklist.close();
+  blocklistOffset = 0; numHashes = 0;
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+  if (!blocklist) { Serial.println("blocklist: none on flash"); return; }
+  uint32_t count = validBlocklist(blocklist);
+  if (!count) {                                    // legacy raw .bin, corrupt, or from a newer format
+    Serial.println("blocklist: invalid/legacy data -> not loaded (upload a new blocklist.bin)");
+    blocklist.close();
+    return;
+  }
+  blocklistOffset = BL_HEADER_SIZE;
+  numHashes = count;
   buildFlashIndex();
+  Serial.printf("blocklist: %u domains (format v%u, %u-byte hashes)\n", numHashes, BL_VERSION, HASH_BYTES);
 }
 static void beginBlocklistSwap() {
   if (blocklist) blocklist.close();
-  numHashes = 0;
+  numHashes = 0; blocklistOffset = 0;
   LittleFS.remove(BLOCKLIST_PATH);
   LittleFS.remove("/blocklist.new");
 }
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
   File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
-  reopenBlocklist();
-  return ok;
+  uint32_t count = validBlocklist(f);
+  if (f) f.close();
+  if (!count) { LittleFS.remove("/blocklist.new"); reopenBlocklist(); return false; }
+  if (!LittleFS.rename("/blocklist.new", BLOCKLIST_PATH)) { reopenBlocklist(); return false; }
+  // Already CRC-checked -> open and index without a second payload pass.
+  if (blocklist) blocklist.close();
+  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+  blocklistOffset = BL_HEADER_SIZE;   // checked non-zero above
+  numHashes = count;
+  buildFlashIndex();
+  return true;
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
@@ -373,7 +455,7 @@ static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : "rejected: not a valid blocklist container (bad magic/version/size/CRC?)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -549,12 +631,7 @@ void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) {
-    numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    buildFlashIndex();
-  }
+  reopenBlocklist();                    // opens + CRC-checks /blocklist.bin, else fail-open
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
