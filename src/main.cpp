@@ -519,14 +519,18 @@ static void handlePortalRoot() {
     "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>C3 AdBlock setup</title>"
     "<body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#0d1117;color:#c9d1d9'>"
-    "<h2>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
-    "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
+    "<h2 id=h2x>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
+    "<p id=p1 style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
     "<form method=POST action=/wifisave>"
-    "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
+    "<input id=sf list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
     "<datalist id=nets>" + portalOpts + "</datalist>"
-    "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
-    "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#3fb950;color:#000;font-weight:600;cursor:pointer'>Connect</button>"
-    "</form></body>";
+    "<input id=pw name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
+    "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#3fb950;color:#000;font-weight:600;cursor:pointer' id=go>Connect</button>"
+    "</form>"
+    "<script>if((navigator.language||'').startsWith('zh')){document.title='C3 AdBlock 配网';"
+    "h2x.innerHTML='&#128737; C3 AdBlock &mdash; WiFi 配网';"
+    "p1.textContent='选择你家网络并输入密码，设备将重启并自动连接。';"
+    "sf.placeholder='WiFi 名称';pw.placeholder='密码';go.textContent='连接'}</script></body>";
   web.send(200, "text/html", html);
 }
 static void handleWifiSave() {
@@ -534,8 +538,10 @@ static void handleWifiSave() {
   if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
   web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
-                             "&#9989; Saved. Restarting and joining <b>" + htmlEscape(ss) + "</b>&hellip;<br><br>"
-                             "Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</body>");
+                             "<span id=a>&#9989; Saved. Restarting and joining <b id=ssid>" + htmlEscape(ss) + "</b>&hellip;</span><br><br>"
+                             "<span id=b>Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</span>"
+                             "<script>if((navigator.language||'').startsWith('zh')){a.innerHTML='&#9989; 已保存。正在重启并连接 <b>'+ssid.innerHTML+'</b>&hellip;';"
+                             "b.textContent='请将手机重连回原来的 WiFi，然后访问 c3adblock.local 打开管理后台。'}</script></body>");
   delay(900); ESP.restart();
 }
 // Never returns — blocks in the portal loop until creds are saved (then reboots).
