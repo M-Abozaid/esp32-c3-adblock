@@ -1,8 +1,8 @@
 #pragma once
 // Copy this file to secrets.h and fill in your WiFi credentials.
 // secrets.h is gitignored so your credentials never get committed.
-static const char* WIFI_SSID = "YOUR_WIFI_SSID";
-static const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+static const char* WIFI_SSID = "HomePluss+";
+static const char* WIFI_PASS = "swadaya1";
 
 // Auth for the dashboard's state-changing endpoints (/ban, /addblock, /upload,
 // /update, /setupdate, /forgetwifi) and for network OTA (ArduinoOTA). These used
