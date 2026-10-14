@@ -166,6 +166,37 @@ un-blocks that exact entry — it can't carve a subdomain out of a blocked paren
 can't be downloaded the build stops instead of silently producing a smaller list
 (`--allow-missing` to override).
 
+### Presets: ads, threats, or both
+
+`--preset NAME` picks a ready-made source set; any extra sources you list are added to it.
+
+| Preset | Sources | Blocks | Entries (Oct 2026) | Fits stock partitions? |
+| --- | --- | --- | --- | --- |
+| `default` | StevenBlack base + HaGeZi Light | ads, trackers, some malware | ~107k | yes (~41%) |
+| `threats` | HaGeZi Threat Intelligence Feeds (mini) | malware, phishing, scams, spam | ~236k | yes (~90%) |
+| `security` | HaGeZi Light + TIF mini | ads, trackers, and threats | ~291k | **no** — needs a bigger filesystem |
+
+```bash
+python3 tools/build_blocklist.py data/blocklist.bin --preset threats
+```
+
+Threat feeds churn daily (HaGeZi refreshes TIF every 12 hours), so if you use `threats` or
+`security`, rebuild and upload daily rather than weekly. These lists also grow: TIF mini went
+from ~170k to ~236k entries between July and October 2026.
+
+### Size check
+
+The firmware deletes the old list before it stores the new one, so a list that doesn't fit
+the filesystem leaves the device with no list (or a truncated one) after upload. The build
+therefore checks the output against the filesystem partition in `partitions.csv`, minus
+64 KiB for LittleFS metadata and the dashboard's own files, and **refuses to write anything**
+if it's too big (exit code 3). On the stock dual-OTA layout the budget is 1,310,720 bytes
+(~262k entries).
+
+- `--partitions my-partitions.csv` sizes against a different table (e.g. one with a larger
+  filesystem; reflash over USB after changing partitions).
+- `--max-bytes N` sets the limit directly.
+
 ### WiFi setup (no re-flash needed)
 
 If it can't connect (or you never set `secrets.h`), it starts an open access point
@@ -196,8 +227,9 @@ The dashboard at **http://c3adblock.local** does it all:
   ```
 
 **4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
-blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
-single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
+blocklist (**~260k domains max**; `build_blocklist.py` enforces this, see *Size check*).
+The aggressive 537k "ultimate" list only fits the single-app partition table (no firmware
+OTA). Pick your tradeoff in `partitions.csv`.
 
 ## Security
 
