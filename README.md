@@ -180,6 +180,10 @@ can't be downloaded the build stops instead of silently producing a smaller list
 python3 tools/build_blocklist.py data/blocklist.bin --preset threats
 ```
 
+`security` drops StevenBlack to make room, so it blocks slightly fewer ad domains than
+`default` (e.g. bare `doubleclick.net` is only in StevenBlack; HaGeZi Light covers its
+ad subdomains). Add the StevenBlack URL as an extra source if your filesystem has room.
+
 Threat feeds churn daily (HaGeZi refreshes TIF every 12 hours), so if you use `threats` or
 `security`, rebuild and upload daily rather than weekly. These lists also grow: TIF mini went
 from ~170k to ~236k entries between July and October 2026.
