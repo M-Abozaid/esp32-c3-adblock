@@ -78,7 +78,7 @@ def main():
             s = line.strip()
             if s.startswith(('||', '@@')):
                 line = s                   # AdGuard/ABP syntax: never treat as hosts comment
-            elif '##' in s or '#@#' in s or '#?#' in s or '#%#' in s:
+            elif not s.startswith('#') and ('##' in s or '#@#' in s or '#?#' in s or '#%#' in s):
                 skipped += 1; continue    # cosmetic rule (baidu.com##div.ad) — the old
                                           # split('#') heuristic ate '##' and added the
                                           # bare domain (baidu.com!) to the blocklist
