@@ -45,7 +45,7 @@ makes it undeniable.
 ## Hardware
 
 - Any **ESP32-C3** board (tested on a C3 SuperMini), 4 MB flash, **no PSRAM needed**
-- Classic **ESP32** (DevKit / WROOM, 4 MB) also builds: `pio run -e esp32dev -t upload` (community-contributed, compile-tested; the C3 is the tested target)
+- Classic **ESP32** (DevKit / WROOM, 4 MB) also builds: `pio run -e esp32dev -t upload` and `pio run -e esp32dev -t uploadfs` (confirmed on real hardware in #40; the C3 is the main tested target). Its temperature reading is uncalibrated, so treat it as approximate.
 - **ESP8266** (NodeMCU / D1 mini / any ESP8266EX with 4 MB flash) also builds: `pio run -e esp8266 -t upload` — see [ESP8266 notes](#esp8266-notes) for what changes
 - Power it from a **stable USB source** (a phone charger or your router's USB port).
   Cheap/loose USB-C→A adapters can brown out the radio during WiFi transmit.
@@ -124,7 +124,8 @@ One USB flash to get going — after that, **firmware and blocklist both update 
 
 > ⚠️ Use a **current PlatformIO** — the VSCode PlatformIO extension's bundled core, or
 > `pip install -U platformio` in a venv. The distro/apt `platformio` package (e.g. 4.3.4) is
-> too old and fails with `AttributeError: ... 'resultcallback'` (issue #4). A one-click browser installer is on the way (hosting TBD).
+> too old and fails with `AttributeError: ... 'resultcallback'` (issue #4). The platform version is
+> pinned in `platformio.ini` (newer ones build the C3 image too big for the OTA slot).
 
 ```bash
 # 1. copy the secrets template (gitignored, stays local) and edit it:
@@ -143,7 +144,7 @@ python3 tools/build_blocklist.py data/blocklist.bin
 
 # 3. flash firmware + the blocklist filesystem (the one and only USB flash)
 pio run -t upload
-pio run -t uploadfs
+pio run -t uploadfs          # classic ESP32: add -e esp32dev to BOTH commands
 
 # 4. watch it boot, note the IP / open the dashboard
 pio device monitor          # -> http://c3adblock.local
@@ -173,6 +174,11 @@ type the password, done. To move it to a new network later: click **Forget WiFi*
 the dashboard, or hold the **BOOT** button while powering on, and the setup portal
 comes back. (`/forgetwifi` requires auth now, so it's no longer a bare URL you can
 just visit — see Security below.)
+
+Some C3 SuperMini boards have a poorly matched antenna and misbehave at full TX power
+(#50). The setup AP always runs at 8.5 dBm, and if the C3 can't join your WiFi at full
+power it retries once at 8.5 dBm. To pin a power level, build with e.g.
+`-DWIFI_TX_POWER=WIFI_POWER_8_5dBm` in `build_flags`.
 
 ## Over-the-air updates (no more USB)
 
@@ -248,7 +254,19 @@ safe as that local radio link during the brief setup window.
 ## Use it
 
 Point a device's DNS at the C3's IP, or add it as a **secondary resolver** behind
-your main DNS. Test:
+your main DNS.
+
+**Upstream resolver:** allowed lookups go to Quad9 by default. You can change it under
+**UPSTREAM DNS** on the dashboard (presets, any IPv4, or "use router's DNS"). Keep a public
+resolver if this box is the *backup* for a Pi-hole/AdGuard your router hands out, because
+forwarding to it would fail exactly when the backup is needed. (From China, AliDNS
+`223.5.5.5` is much faster than Quad9; see #47.)
+
+**IPv6:** this resolver answers over IPv4. If your router also advertises an IPv6 DNS
+server (RDNSS/DHCPv6), devices may use that and bypass the blocker, so turn it off or point
+it elsewhere on the router.
+
+Test:
 
 ```bash
 dig @<c3-ip> doubleclick.net   # -> 0.0.0.0  (blocked)
@@ -274,8 +292,12 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
 - ✅ mDNS (`c3adblock.local`) for discovery
 - ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
-- ✅ Captive-portal WiFi setup (no hardcoded creds) + one-click browser web-installer
-- ⬜ Bucketed prefix index — ~18 flash reads/lookup → ~1–2 (issue #3), the throughput win
+- ✅ Captive-portal WiFi setup (no hardcoded creds)
+- ✅ Weekly blocklist release + validated updates (a bad download never replaces a working list)
+- ✅ Configurable upstream resolver
+- ⬜ One-click browser web-installer (built in `docs/`, needs hosting again)
+- ⬜ DNS answer cache + non-blocking forwarding (#40, #47)
+- ⬜ Smaller on-flash format (#3/#21): 3-byte suffixes, ~40% more domains per MB
 - ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play
 
 ## Credits

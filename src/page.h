@@ -40,7 +40,7 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
 <h2>FIRMWARE &mdash; OTA UPDATE</h2>
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/&lt;env&gt;/firmware.bin</code> (<code>c3</code>, <code>esp32dev</code>, ...) &mdash; device verifies it and reboots into it</div>
 <h2>UPSTREAM DNS &mdash; FORWARDER</h2>
 <div style=margin-bottom:6px><input id=dnsip placeholder="9.9.9.9" size=18>
 <button onclick=saveDns()>Save</button> <button onclick="presetDns('1.1.1.1')">Cloudflare</button> <button onclick="presetDns('94.140.14.14')">AdGuard</button> <button onclick="dnsMode('router')">Use router's DNS</button> <button onclick="dnsMode('reset')">Default (Quad9)</button> <span id=dnsmsg style=color:#8b949e></span></div>
