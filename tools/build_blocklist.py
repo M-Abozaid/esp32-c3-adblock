@@ -75,7 +75,15 @@ def main():
             if not ALLOW_MISSING: sys.exit(1)
             continue
         for line in data.splitlines():
-            line = line.split('#', 1)[0].strip() if not line.lstrip().startswith(('||', '@@')) else line.strip()
+            s = line.strip()
+            if s.startswith(('||', '@@')):
+                line = s                   # AdGuard/ABP syntax: never treat as hosts comment
+            elif '##' in s or '#@#' in s or '#?#' in s or '#%#' in s:
+                skipped += 1; continue    # cosmetic rule (baidu.com##div.ad) — the old
+                                          # split('#') heuristic ate '##' and added the
+                                          # bare domain (baidu.com!) to the blocklist
+            else:
+                line = s.split('#', 1)[0].strip()
             if not line or line[0] in '!/[':
                 continue
             # AdGuard / ABP basic rules: ||example.com^  and allow rules @@||example.com^
