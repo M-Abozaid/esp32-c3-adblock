@@ -43,7 +43,7 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
 <h2>UPSTREAM DNS &mdash; FORWARDER</h2>
 <div style=margin-bottom:6px><input id=dnsip placeholder="9.9.9.9" size=18>
-<button onclick=saveDns()>Save</button> <button onclick="dnsMode('router')">Use router's DNS</button> <button onclick="dnsMode('reset')">Default (Quad9)</button> <span id=dnsmsg style=color:#8b949e></span></div>
+<button onclick=saveDns()>Save</button> <button onclick="presetDns('1.1.1.1')">Cloudflare</button> <button onclick="presetDns('94.140.14.14')">AdGuard</button> <button onclick="dnsMode('router')">Use router's DNS</button> <button onclick="dnsMode('reset')">Default (Quad9)</button> <span id=dnsmsg style=color:#8b949e></span></div>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">where allowed lookups are forwarded. Keep the default if this box is the <i>backup</i> for a Pi-hole/AdGuard your router hands out &mdash; forwarding there fails exactly when the backup is needed.</div>
 <h2>WIFI</h2>
 <div style=margin-bottom:18px><button onclick="if(confirm('Forget saved WiFi and reboot into the setup portal?'))forgetWifi()">Forget WiFi</button></div>
@@ -83,6 +83,7 @@ function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
 function forgetWifi(){fetch('/forgetwifi',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>alert(t))}
 function saveDns(){let v=dnsip.value.trim();if(!v)return;fetch('/setdns?ip='+encodeURIComponent(v),{headers:CSRF_HDRS}).then(async r=>{if(!r.ok)alert('✗ '+await r.text());load()})}
+function presetDns(ip){dnsip.value=ip;saveDns()}
 function dnsMode(m){fetch('/setdns?'+m+'=1',{headers:CSRF_HDRS}).then(load)}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);

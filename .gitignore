@@ -17,3 +17,5 @@ src/secrets.h
 
 # Backups / scratch
 *.bak
+
+__pycache__/

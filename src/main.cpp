@@ -237,6 +237,8 @@ enum UpstreamMode { UP_BUILTIN, UP_ROUTER, UP_CUSTOM };
 static UpstreamMode upstreamMode = UP_BUILTIN;
 static IPAddress    upstreamSaved;               // the custom address, when UP_CUSTOM
 static const char*  upstreamSource = "built-in";
+// 0.0.0.0 and 255.255.255.255 parse as valid IPv4 but would silently stop all forwarding.
+static bool usableResolver(const IPAddress& ip) { return (uint32_t)ip != 0 && (uint32_t)ip != 0xFFFFFFFF; }
 static void upstreamApply() {
   const IPAddress self = WiFi.localIP();
   if (upstreamMode == UP_CUSTOM) { upstreamDns = upstreamSaved; upstreamSource = "custom"; return; }
@@ -254,7 +256,7 @@ static void upstreamLoad() {
     String l = f.readStringUntil('\n'); l.trim(); f.close();
     IPAddress ip;
     if (l == "router") upstreamMode = UP_ROUTER;
-    else if (l.length() && ip.fromString(l)) { upstreamSaved = ip; upstreamMode = UP_CUSTOM; }
+    else if (l.length() && ip.fromString(l) && usableResolver(ip)) { upstreamSaved = ip; upstreamMode = UP_CUSTOM; }
   }
   upstreamApply();
 }
@@ -674,6 +676,7 @@ void setup() {
     else {
       IPAddress v;
       if (!v.fromString(web.arg("ip"))) { web.send(400, "text/plain", "not an IPv4 address"); return; }
+      if (!usableResolver(v)) { web.send(400, "text/plain", "0.0.0.0 / broadcast is not a resolver"); return; }
       if (v == WiFi.localIP()) { web.send(400, "text/plain", "that is this device; pick another resolver"); return; }
       upstreamSaved = v; upstreamMode = UP_CUSTOM;
     }
