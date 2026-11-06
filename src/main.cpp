@@ -4,19 +4,30 @@
 // ban clients, add custom block domains. All control state persisted to flash.
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <WiFiUdp.h>
 #include <LittleFS.h>
-#include <ESPmDNS.h>
-#include <WebServer.h>
-#include <Update.h>            // firmware OTA
-#include <HTTPClient.h>        // remote blocklist fetch
 #include <WiFiClientSecure.h>  // https fetch
 #include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
 #include <DNSServer.h>         // captive-portal catch-all DNS
-#include <Preferences.h>       // NVS store for provisioned WiFi creds
-#include "lwip/etharp.h"
-#include "lwip/netif.h"
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>         // the ESP8266 core has no WiFi.h
+  #include <ESP8266WebServer.h>    // the ESP8266 core has no WebServer.h
+  #include <ESP8266HTTPClient.h>   // the ESP8266 core has no HTTPClient.h
+  #include <ESP8266mDNS.h>
+  #include <Updater.h>             // firmware OTA (the ESP8266 core ships Updater.h, not Update.h)
+  #include "prefs_shim.h"          // EEPROM-backed stand-in for the NVS "Preferences" API
+  typedef ESP8266WebServer WebServer;   // the ESP8266 class carries a different name
+  #define UPDATE_SIZE_UNKNOWN ((size_t)0xFFFFFFFF)   // the ESP8266 Updater.h doesn't define it
+#else
+  #include <WiFi.h>
+  #include <WebServer.h>
+  #include <HTTPClient.h>        // remote blocklist fetch
+  #include <ESPmDNS.h>
+  #include <Update.h>           // firmware OTA
+  #include <Preferences.h>      // NVS store for provisioned WiFi creds
+  #include "lwip/etharp.h"
+  #include "lwip/netif.h"
+#endif
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
@@ -33,9 +44,21 @@ static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
-static const int INDEX_ENTRIES = 4096;   // 20 KB first-level flash index
-static const int CACHE_SIZE = 256;       // must be power of 2
-static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
+// Overridable from build_flags (see platformio.ini): the ESP8266 gets a 1 MB app slot
+// and ~80 KB of RAM, so it runs with a smaller index, cache and client/custom tables.
+#ifndef INDEX_ENTRIES
+#define INDEX_ENTRIES 4096   // 20 KB first-level flash index
+#endif
+#ifndef CACHE_SIZE
+#define CACHE_SIZE 256       // must be power of 2
+#endif
+// MAX_RANGE must stay >= ceil(numHashes / INDEX_ENTRIES): inFlash() clamps the bucket
+// it scans to MAX_RANGE hashes, so a smaller MAX_RANGE silently misses hashes that
+// land in an overfull bucket. The default 112,556-domain list over INDEX_ENTRIES
+// buckets is ~110 hashes/bucket, so MAX_RANGE=256 has headroom.
+#ifndef MAX_RANGE
+#define MAX_RANGE 256        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
+#endif
 
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
@@ -51,11 +74,15 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
+#ifndef MAX_CLIENTS
+#define MAX_CLIENTS 96
+#endif
+#ifndef MAX_CUSTOM
+#define MAX_CUSTOM 200
+#endif
 struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
-static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
-static const int MAX_CUSTOM = 200;
 String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0;
 
 static const int MAX_BAN = 32;
@@ -75,6 +102,13 @@ String      portalOpts;             // <option> list of scanned networks, built 
 // blocking pause (Pi-hole-style "disable for a while")
 bool     blockingOn = true;
 uint32_t resumeAt   = 0;            // millis() to auto-resume; 0 = paused indefinitely / not paused
+
+// ---------- platform shims ----------
+#if defined(ESP8266)
+// The ESP8266EX has no internal temperature sensor. Same name/signature as the ESP32
+// core's temperatureRead() so the stats JSON is identical on both boards.
+static float temperatureRead() { return 0.0f; }
+#endif
 
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
@@ -209,10 +243,15 @@ static void saveBanned() {
 
 // ---------- client table ----------
 static void getMac(uint32_t ip, uint8_t* mac) {
-  memset(mac, 0, 6); ip4_addr_t ipa; ipa.addr = ip;
+  memset(mac, 0, 6);
+#if !defined(ESP8266)
+  ip4_addr_t ipa; ipa.addr = ip;
   struct eth_addr* eth = nullptr; const ip4_addr_t* ipret = nullptr;
   for (struct netif* nif = netif_list; nif; nif = nif->next)
     if (etharp_find_addr(nif, &ipa, &eth, &ipret) >= 0 && eth) { memcpy(mac, eth->addr, 6); return; }
+#else
+  (void)ip;   // the ESP8266 exposes no ARP table; clients are identified by IP
+#endif
 }
 static Dev* getClient(uint32_t ip) {
   for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
@@ -291,7 +330,11 @@ static int forwardUpstream(int qlen, int qend) {
   upstreamCli.flush();                                   // release any half-read buffer
   while (upstreamCli.parsePacket() > 0) upstreamCli.flush();   // drop stale late replies
   const uint8_t cid0 = buf[0], cid1 = buf[1];
-  const uint16_t wid = (uint16_t)esp_random();
+#if defined(ESP8266)
+  const uint16_t wid = (uint16_t)ESP.random();   // the ESP8266 core's EspClass has random()
+#else
+  const uint16_t wid = (uint16_t)esp_random();    // ESP32's EspClass has no random()
+#endif
   uint8_t q[260]; int ql = qend - 12;
   const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
   if (haveQ) memcpy(q, buf + 12, ql);
@@ -481,7 +524,18 @@ static void saveUpdateCfg() {
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
+  WiFiClientSecure cs;
+#if defined(ESP8266)
+  // ESP8266 BearSSL: allowSelfSignedCerts() accepts ONLY self-signed certs, and
+  // GitHub's release CDN serves a CA-signed chain -> that call would fail the
+  // handshake. setInsecure() exists in this core and skips verification outright,
+  // which is what the ESP32 build does (blocklist isn't secret).
+  cs.setInsecure();
+  cs.setBufferSizes(8192, 1024);   // trim BearSSL RAM (core default is 16384/512;
+                                    // 2048 would overflow on a ~4 KB cert record)
+#else
+  cs.setInsecure();                // blocklist isn't secret -> skip cert pinning
+#endif
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
@@ -520,7 +574,16 @@ static void handleFwUpload() {
     fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
     if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
     Serial.printf("[fw-ota] %s\n", u.filename.c_str());
+#if defined(ESP8266)
+    // The ESP8266 Updater stages the image at (end of sketch space - size) and needs a
+    // real size up front: UPDATE_SIZE_UNKNOWN overflows the sector rounding to 0, which
+    // would stage the image on top of the LittleFS partition. Use the free sketch
+    // space instead, exactly like the core's own WebUpdate example.
+    uint32_t sz = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    if (!Update.begin(sz)) Update.printError(Serial);
+#else
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+#endif
   } else if (u.status == UPLOAD_FILE_WRITE) {
     if (!fwAuthOk) return;
     if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
@@ -530,7 +593,13 @@ static void handleFwUpload() {
     else Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_ABORTED) {
     if (!fwAuthOk) return;
-    Update.abort(); Serial.println("[fw-ota] aborted");
+#if defined(ESP8266)
+    Update.end(false);   // the ESP8266 Updater has no abort(): end(false) resets the
+                         // updater state without staging the image
+#else
+    Update.abort();
+#endif
+    Serial.println("[fw-ota] aborted");
   }
 }
 
@@ -631,7 +700,11 @@ static void startConfigPortal() {
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
+#if defined(ESP8266)
+  if (!LittleFS.begin()) Serial.println("LittleFS FAILED");  // ESP8266's begin() takes no args and auto-formats
+#else
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
+#endif
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
     numHashes = blocklist.size() / HASH_BYTES;
@@ -640,9 +713,12 @@ void setup() {
   }
   loadCustom(); loadBanned(); loadUpdateCfg(); upstreamLoad();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+  Serial.printf("[mem] free heap %u bytes\n", (unsigned)ESP.getFreeHeap());
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
-#if CONFIG_IDF_TARGET_ESP32C3
+#if defined(ESP8266)
+  const int BOOT_PIN = 0;     // ESP8266 FLASH button (GPIO0)
+#elif CONFIG_IDF_TARGET_ESP32C3
   const int BOOT_PIN = 9;     // C3 BOOT button
 #else
   const int BOOT_PIN = 0;     // classic ESP32 BOOT button (GPIO9 is a flash pin there)
@@ -664,7 +740,11 @@ void setup() {
                     "device on a network you don't fully control.");
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
-  { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
+#if defined(ESP8266)
+  web.collectHeaders(CSRF_HEADER);       // ESP8266's collectHeaders is variadic
+#else
+  { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }
+#endif  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);

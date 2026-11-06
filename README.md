@@ -3,6 +3,7 @@
 [日本語 README](README_JP.md)
 
 A **Pi-hole-style DNS ad-blocker** that runs on a **$2 ESP32-C3** — *no PSRAM required*.
+Also builds for the **ESP8266** (NodeMCU / D1 mini, 4 MB flash) — see [ESP8266 notes](#esp8266-notes).
 
 > 📰 Featured on [Tom's Hardware](https://www.tomshardware.com/networking/clever-hacker-fits-537-000-domains-in-a-tiny-usd5-esp32-ad-blocking-dongle-firmware-uses-only-around-50kb-of-ram-and-can-answer-blocked-lookups-in-10-milliseconds), [XDA Developers](https://www.xda-developers.com/this-tiny-esp32-powered-gadget-blocks-537000-domains-only-uses-50kb-of-ram/), and [Korben](https://korben.info/en/half-million-ad-blocking-domains-50kb-ram-esp32.html).
 
@@ -45,10 +46,47 @@ makes it undeniable.
 
 - Any **ESP32-C3** board (tested on a C3 SuperMini), 4 MB flash, **no PSRAM needed**
 - Classic **ESP32** (DevKit / WROOM, 4 MB) also builds: `pio run -e esp32dev -t upload` (community-contributed, compile-tested; the C3 is the tested target)
+- **ESP8266** (NodeMCU / D1 mini / any ESP8266EX with 4 MB flash) also builds: `pio run -e esp8266 -t upload` — see [ESP8266 notes](#esp8266-notes) for what changes
 - Power it from a **stable USB source** (a phone charger or your router's USB port).
   Cheap/loose USB-C→A adapters can brown out the radio during WiFi transmit.
 - A **USB-A → USB-C dongle** lets it plug straight into the spare USB port on the
   back of most routers — no power supply, no extra box.
+
+### ESP8266 notes
+
+The ESP8266 runs the blocker too — it never had PSRAM to begin with, and the whole
+blocklist lives in flash as 40-bit hashes either way. It is the slowest and most
+cramped target, but it is the cheapest board you can plug into a router.
+
+```bash
+pio run -e esp8266 -t upload
+pio run -e esp8266 -t uploadfs
+```
+
+What changes on the ESP8266 (the C3 and classic-ESP32 builds are untouched):
+
+| | ESP32-C3 | ESP8266 |
+|---|---|---|
+| Flash used | ~1.24 MB | ~0.50 MB of a 1,044,464-byte app slot |
+| Static RAM | 78 KB of 320 KB | 44 KB of 80 KB |
+| Flash index (`INDEX_ENTRIES`) | 4096 | 1024 |
+| Hash cache (`CACHE_SIZE`) | 256 | 64 |
+| Tracked clients / custom domains | 96 / 200 | 32 / 50 |
+| Client identification | IP + MAC (lwIP ARP table) | IP only (no ARP table exposed) |
+| Temperature reading | internal sensor | 0 °C (no sensor) |
+| Filesystem | 1.3 MB LittleFS | 1 MB LittleFS |
+
+The smaller index still resolves the 112,556-domain default list with no misses: the
+widest bucket is 112 hashes, well inside the 256-hash scan window, so every stored
+hash stays reachable. If you load a much larger list, raise `INDEX_ENTRIES` and keep
+`MAX_RANGE >= ceil(domains / INDEX_ENTRIES)` — `inFlash()` clamps the bucket it scans
+to `MAX_RANGE`, so a too-small value silently misses hashes.
+
+Two shims make it work: `src/prefs_shim.h` backs the ESP32's NVS `Preferences` API
+with the ESP8266's EEPROM, and `getMac()` is stubbed out (the ESP8266 exposes no ARP
+table). Firmware OTA stages the image in the free sketch space between the app and
+the filesystem, and the HTTPS blocklist fetch uses BearSSL (`setInsecure()`,
+`setBufferSizes(8192, 1024)`) instead of mbedTLS.
 
 ### Enclosure
 
@@ -60,6 +98,25 @@ Printing notes:
   short edge opposite the USB-C port — don't bury it in solid plastic or put metal
   near it, or your RSSI will suffer.
 - Leave the vents open: the board idles around 45–55 °C.
+
+The C3 case does **not** fit an ESP8266 dev board (it is 44 × 25 mm, sized for
+the SuperMini footprint). For NodeMCU / D1 mini class boards use the parametric
+case: [`hardware/esp8266-enclosure.py`](hardware/esp8266-enclosure.py) writes the
+STL itself (no CAD tool needed), and
+[`hardware/esp8266-enclosure.scad`](hardware/esp8266-enclosure.scad) is the same
+geometry for OpenSCAD. Pre-generated for the 30 × 58 mm NodeMCU:
+[`hardware/esp8266-nodemcu-enclosure.stl`](hardware/esp8266-nodemcu-enclosure.stl)
+
+Measure the board first — width across the two header rows, and length from the
+USB end to the antenna end — then regenerate:
+
+```
+python3 hardware/esp8266-enclosure.py --board-w 30 --board-l 58 --out case.stl
+```
+
+It is a tray: the board drops in from the top, the side ribs catch the header
+strips, the end wall leaves a slot for the USB plug, and the antenna end is left
+open. Same printing notes as above.
 
 ## Build & flash (PlatformIO)
 
