@@ -11,25 +11,28 @@ Usage: build_blocklist.py [out.bin] [--preset NAME] [src ...] [--allow-missing]
   src = local file or URL. With no src and no --preset, uses the 'default' preset.
   With --preset, the preset's sources are used and any src given is added to them.
 
-  Presets:
-    default   StevenBlack base + Hagezi Light, ~100k entries: blocks ads/trackers/malware
+  Presets (entry counts drift daily as the feeds change):
+    default   StevenBlack base + Hagezi Light, ~100-140k entries: blocks ads/trackers/malware
               but leaves WhatsApp/Instagram/social/messaging working.
     threats   Hagezi Threat Intelligence Feeds (mini): malware, phishing, scam, spam.
-              Security only, no ad blocking. ~236k entries as of Oct 2026.
-    security  Hagezi Light + TIF mini: ads/trackers plus threats. ~291k entries as of
-              Oct 2026, which does NOT fit the stock dual-OTA filesystem partition;
-              needs a larger filesystem partition (see README).
+              Security only, no ad blocking. ~190-240k entries; fits the stock partitions.
+    security  NEEDS A CUSTOM PARTITION TABLE. Hagezi Light + TIF mini: ads/trackers plus
+              threats, ~260-290k entries. That is over the stock dual-OTA filesystem budget,
+              so on the stock partitions.csv the size check refuses it. Use it only with a
+              table that gives the filesystem more room (pass it with --partitions).
 
   For the aggressive "test the limits" build (~500k, also blocks social/messaging):
     build_blocklist.py blocklist.bin \\
       https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts \\
       https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt
 
-Size check: the output must fit the device's LittleFS partition, because the firmware
-deletes the old list before writing the new one. An upload that doesn't fit leaves the
-device with no list (or a truncated one). The budget is read from ../partitions.csv
-(the spiffs/littlefs data partition, minus FS_HEADROOM) and the build refuses to write
-an output that exceeds it (exit code 3). Override with --max-bytes or --partitions.
+Size check: the output must fit the device's LittleFS partition. The firmware keeps the
+live list while it receives a new one only when there is room for both; a list too big
+for the filesystem makes it free the live list first, and the upload then fails, leaving
+the device blocking nothing until the next good update. The budget is read from
+../partitions.csv (the spiffs/littlefs data partition, minus FS_HEADROOM) and the build
+refuses to write an output that exceeds it (exit code 3). Override with --max-bytes or
+--partitions.
 """
 import argparse
 import math
@@ -180,7 +183,9 @@ def parse_args(argv):
     p = argparse.ArgumentParser(description='Build the device blocklist hash blob.')
     p.add_argument('out', nargs='?', default='blocklist.bin', help='output file (default blocklist.bin)')
     p.add_argument('sources', nargs='*', help='URLs or local files')
-    p.add_argument('--preset', choices=sorted(PRESETS), help='named source set; extra sources are added to it')
+    p.add_argument('--preset', choices=sorted(PRESETS),
+                   help="named source set; extra sources are added to it. "
+                        "'security' needs a custom partition table with a bigger filesystem")
     p.add_argument('--allow-missing', action='store_true', help='continue if a source cannot be read')
     p.add_argument('--max-bytes', type=int, help='explicit output size limit in bytes (overrides partitions.csv)')
     p.add_argument('--partitions', help='partition table to size against (default: ../partitions.csv)')
@@ -213,9 +218,12 @@ def main(argv=None):
         over = size - budget
         print(f'  !! TOO BIG for the device: {size:,} bytes ({n:,} entries) > budget {budget:,} bytes ({why}).\n'
               f'     Over by {over:,} bytes (~{math.ceil(over / HASH_BYTES):,} entries). Nothing written to {a.out}.\n'
-              f'     The firmware deletes the old list before storing the new one, so uploading this\n'
-              f'     would leave the device unprotected. Use fewer/smaller sources, or a partition\n'
-              f'     table with a bigger filesystem (then point --partitions at it).', file=sys.stderr)
+              f'     A list this size cannot be stored next to the live one, so the device would free\n'
+              f'     its current list and end up blocking nothing. Use fewer/smaller sources, or a\n'
+              f'     partition table with a bigger filesystem (then point --partitions at it).', file=sys.stderr)
+        if a.preset == 'security':
+            print("     The 'security' preset needs a custom partition table; on the stock layout\n"
+                  "     use --preset threats (or default) instead.", file=sys.stderr)
         sys.exit(3)
 
     # write atomically so a failed run never leaves a half-written blocklist behind

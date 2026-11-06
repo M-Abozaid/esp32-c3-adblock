@@ -170,28 +170,33 @@ can't be downloaded the build stops instead of silently producing a smaller list
 
 `--preset NAME` picks a ready-made source set; any extra sources you list are added to it.
 
-| Preset | Sources | Blocks | Entries (Oct 2026) | Fits stock partitions? |
+| Preset | Sources | Blocks | Entries (approx.) | Stock partitions |
 | --- | --- | --- | --- | --- |
-| `default` | StevenBlack base + HaGeZi Light | ads, trackers, some malware | ~107k | yes (~41%) |
-| `threats` | HaGeZi Threat Intelligence Feeds (mini) | malware, phishing, scams, spam | ~236k | yes (~90%) |
-| `security` | HaGeZi Light + TIF mini | ads, trackers, and threats | ~291k | **no** — needs a bigger filesystem |
+| `default` | StevenBlack base + HaGeZi Light | ads, trackers, some malware | 100–140k | fits |
+| `threats` | HaGeZi Threat Intelligence Feeds (mini) | malware, phishing, scams, spam | 190–240k | fits |
+| `security` | HaGeZi Light + TIF mini | ads, trackers, and threats | 260–290k | **needs a custom partition table** |
 
 ```bash
 python3 tools/build_blocklist.py data/blocklist.bin --preset threats
 ```
 
-`security` drops StevenBlack to make room, so it blocks slightly fewer ad domains than
-`default` (e.g. bare `doubleclick.net` is only in StevenBlack; HaGeZi Light covers its
-ad subdomains). Add the StevenBlack URL as an extra source if your filesystem has room.
+The feeds change every day, so treat the entry counts as rough; the build prints the real
+number and how much of the device's budget it uses.
 
-Threat feeds churn daily (HaGeZi refreshes TIF every 12 hours), so if you use `threats` or
-`security`, rebuild and upload daily rather than weekly. These lists also grow: TIF mini went
-from ~170k to ~236k entries between July and October 2026.
+`security` needs a custom partition table. It is over the stock filesystem budget, so on
+the stock `partitions.csv` the size check refuses it. It is there for people who already
+run a layout with a bigger filesystem (pass that table with `--partitions`). It also leaves
+out StevenBlack to save space, so it blocks slightly fewer ad domains than `default`
+(bare `doubleclick.net`, for example, is only in StevenBlack).
+
+HaGeZi refreshes the threat feeds every 12 hours, so if you use `threats` or `security`,
+rebuild and upload daily rather than weekly.
 
 ### Size check
 
-The firmware deletes the old list before it stores the new one, so a list that doesn't fit
-the filesystem leaves the device with no list (or a truncated one) after upload. The build
+The firmware keeps the live list while a new one arrives only when the filesystem has room
+for both. A list too big for the filesystem makes it free the live list first, and the
+upload then fails, so the device blocks nothing until the next good update. The build
 therefore checks the output against the filesystem partition in `partitions.csv`, minus
 64 KiB for LittleFS metadata and the dashboard's own files, and **refuses to write anything**
 if it's too big (exit code 3). On the stock dual-OTA layout the budget is 1,310,720 bytes
@@ -200,6 +205,9 @@ if it's too big (exit code 3). On the stock dual-OTA layout the budget is 1,310,
 - `--partitions my-partitions.csv` sizes against a different table (e.g. one with a larger
   filesystem; reflash over USB after changing partitions).
 - `--max-bytes N` sets the limit directly.
+- The check reads the ESP32 `partitions.csv`, so it doesn't know about the ESP8266's smaller
+  filesystem (1,024,000 bytes with `eagle.flash.4m1m.ld`). For an ESP8266 pass
+  `--max-bytes 958464`. `default` fits there; `threats` usually doesn't.
 
 ### WiFi setup (no re-flash needed)
 
