@@ -125,12 +125,82 @@ static inline void packHash(uint64_t h, uint8_t* b) {
   for (int k = 0; k < HASH_BYTES; k++) { b[k] = (uint8_t)h; h >>= 8; }
 }
 
+// Keep both watchdogs fed around flash writes: yield() feeds the software WDT,
+// ESP.wdtFeed() the hardware one. A LittleFS block erase can stall the CPU for
+// hundreds of ms, and an erase that starts inside a write can outlast the
+// software-WDT window — uploads rebooted the device before this existed.
+#if defined(ESP8266)
+static inline void otaYield() { yield(); ESP.wdtFeed(); }
+// WiFi TX bursts are the ESP8266's largest current draw, and they coincide with
+// the flash erase spike during an upload; a marginal regulator browns the chip out
+// exactly then. Dropping TX power buys the erase the headroom it needs. Only done
+// when the link has margin to spare — on a weak signal, full power keeps the
+// connection alive instead, which matters more.
+static bool g_otaLowPower = false;   // only restore TX power if we actually dropped it
+static void otaPowerDown() { if (WiFi.RSSI() > -45) { WiFi.setOutputPower(10.0f); g_otaLowPower = true; } }
+static void otaPowerRestore() { if (g_otaLowPower) { WiFi.setOutputPower(20.5f); g_otaLowPower = false; } }
+#else
+static inline void otaYield() { yield(); }
+static void otaPowerDown() {}
+static void otaPowerRestore() {}
+#endif
+// True while ANY flash-writing operation is in progress (firmware OTA, blocklist
+// upload, or ArduinoOTA). The periodic auto-fetch and a second concurrent upload
+// must not touch the flash at the same time.
+static volatile bool otaInProgress = false;
+
+// ---- diagnostics ----
+// Why the device booted last time, captured before anything else can change it.
+char bootReset[24] = {0};       // ESP.getResetReason() at boot
+char bootCrash[160] = {0};      // exception register dump, watchdog/exception resets only
+char lastOp[12] = "none";       // upload | fetch | none
+bool lastOpOk = false;          // did it commit?
+uint32_t lastOpBytes = 0;       // bytes the filesystem actually accepted
+uint32_t lastOpAt = 0;          // when that operation finished
+uint32_t upWritten = 0;         // bytes written by the in-flight blocklist upload
+static void setLastOp(const char* op, bool ok, uint32_t bytes) {
+  strncpy(lastOp, op, sizeof(lastOp) - 1); lastOp[sizeof(lastOp) - 1] = 0;
+  lastOpOk = ok; lastOpBytes = bytes; lastOpAt = millis();
+}
+// LittleFS usage: the ESP8266 core exposes FSInfo/info(), the ESP32 core only
+// totalBytes()/usedBytes().
+static void fsUsage(size_t& total, size_t& used) {
+  total = 0; used = 0;
+#if defined(ESP8266)
+  FSInfo fs;
+  if (LittleFS.info(fs)) { total = fs.totalBytes; used = fs.usedBytes; }
+#else
+  total = LittleFS.totalBytes();
+  used = LittleFS.usedBytes();
+#endif
+}
+#if !defined(ESP8266)
+// The ESP32 core has no getResetReason(); ESP-IDF does.
+static const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_UNKNOWN:   return "Unknown";
+    case ESP_RST_POWERON:   return "Power On";
+    case ESP_RST_EXT:       return "External System";
+    case ESP_RST_SW:        return "Software/System restart";
+    case ESP_RST_PANIC:     return "Exception";
+    case ESP_RST_INT_WDT:   return "Interrupt Watchdog";
+    case ESP_RST_TASK_WDT:  return "Task Watchdog";
+    case ESP_RST_WDT:       return "Other Watchdog";
+    case ESP_RST_DEEPSLEEP: return "Deep Sleep";
+    case ESP_RST_BROWNOUT:  return "Brown out";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "?";
+  }
+}
+#endif
+
 static void buildFlashIndex() {
   if (!blocklist || numHashes == 0) return;
   for (int i = 0; i < INDEX_ENTRIES; i++) {
     uint32_t pos = (uint32_t)((uint64_t)i * (numHashes - 1) / (INDEX_ENTRIES - 1));
     blocklist.seek((uint32_t)pos * HASH_BYTES);
     blocklist.read(blIndex[i], HASH_BYTES);
+    if ((i & 31) == 0) otaYield();   // 1,024 strided LittleFS reads take seconds; feed the watchdog
   }
   for (int i = 0; i < CACHE_SIZE; i++) cacheValid[i] = 0;
 }
@@ -213,7 +283,7 @@ static void loadCustom() {
   }
   f.close();
 }
-static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
+static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) { f.println(customDom[i]); otaYield(); } f.close(); }
 static bool addCustom(String d) {
   d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
   if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
@@ -237,7 +307,7 @@ static void saveBanned() {
   numBanned = 0;
   for (int i = 0; i < numClients && numBanned < MAX_BAN; i++) if (clients[i].banned) bannedIP[numBanned++] = clients[i].ip;
   File f = LittleFS.open("/banned.txt", "w"); if (!f) return;
-  for (int i = 0; i < numBanned; i++) { IPAddress ip(bannedIP[i]); f.println(ip.toString()); }
+  for (int i = 0; i < numBanned; i++) { IPAddress ip(bannedIP[i]); f.println(ip.toString()); otaYield(); }
   f.close();
 }
 
@@ -403,24 +473,99 @@ static String htmlEscape(const String& s) {
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 
+// /stats.json is streamed from a small static buffer. The String build that
+// this replaced allocated ~3 KB plus ~6 temporaries per client on EVERY poll,
+// and this board runs ~29 KB free heap.
+static char jsonBuf[256];
+static size_t jsonLen = 0;
+static void jsonFlush() { if (jsonLen) { web.sendContent(jsonBuf, jsonLen); jsonLen = 0; } }
+static void jsonPut(const char* s, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if (jsonLen == sizeof(jsonBuf)) jsonFlush();
+    jsonBuf[jsonLen++] = s[i];
+  }
+}
+static void jsonPut(const char* s) { jsonPut(s, strlen(s)); }
+static void jsonPutf(const char* fmt, ...) {
+  char t[128];
+  va_list ap; va_start(ap, fmt);
+  int n = vsnprintf(t, sizeof(t), fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  if ((size_t)n > sizeof(t) - 1) n = sizeof(t) - 1;
+  jsonPut(t, (size_t)n);
+}
+static void jsonPutEsc(const char* s) {
+  for (; *s; s++) {
+    unsigned char ch = (unsigned char)*s;
+    if (ch == '"' || ch == '\\') { char e[2] = {'\\', (char)ch}; jsonPut(e, 2); }
+    else if (ch < 0x20) jsonPutf("\\u%04x", (unsigned)ch);
+    else jsonPut((const char*)&ch, 1);
+  }
+}
+static void jsonPutEsc(const String& s) { jsonPutEsc(s.c_str()); }
+static void jsonPutIp(uint32_t ip) {
+  IPAddress a(ip);
+  char b[16];
+  snprintf(b, sizeof(b), "%u.%u.%u.%u", (unsigned)a[0], (unsigned)a[1], (unsigned)a[2], (unsigned)a[3]);
+  jsonPut(b);
+}
 static void handleStats() {
   uint32_t up = millis() / 1000;
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
-  String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
-             ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"dns\":\"" + upstreamDns.toString() + "\",\"dnsSource\":\"" + upstreamSource + "\"" +
-             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
-             ",\"blocking\":" + (blockingOn ? "true" : "false") +
-             ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
-             ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
-             ",\"clients\":[";
-  for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
-  j += "],\"custom\":[";
-  for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
-  j += "]}";
-  web.send(200, "application/json", j);
+  size_t fsTotal = 0, fsUsed = 0;
+  fsUsage(fsTotal, fsUsed);
+  uint32_t listBytes = blocklist ? (uint32_t)blocklist.size() : 0;
+
+  // Streamed from a 256 B static buffer: the old String build allocated ~3 KB per
+  // poll (plus temporaries per client) and the heap is ~29 KB in total.
+  web.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  web.send(200, "application/json", "");
+  jsonPut("{\"ip\":\""); jsonPutIp((uint32_t)WiFi.localIP());
+  jsonPutf("\",\"blocked\":%lu,\"allowed\":%lu,\"domains\":%lu",
+           (unsigned long)totalBlocked, (unsigned long)totalAllowed, (unsigned long)numHashes);
+  jsonPutf(",\"rssi\":%ld", (long)WiFi.RSSI());
+  float tv = temperatureRead();
+  int ti = (int)tv, tf = (int)((tv - (float)ti) * 10.0f + 0.5f);
+  if (tf >= 10) { ti++; tf = 0; }
+  jsonPutf(",\"temp\":%d.%d", ti, tf);
+  jsonPutf(",\"heap\":%lu", (unsigned long)ESP.getFreeHeap());
+  jsonPut(",\"uptime\":\""); jsonPut(ut);
+  jsonPut("\",\"dns\":\""); jsonPutEsc(upstreamDns.toString());
+  jsonPut("\",\"dnsSource\":\""); jsonPutEsc(upstreamSource);
+  jsonPut("\",\"upurl\":\""); jsonPutEsc(updateUrl);   // leading \" closes the dnsSource string
+  jsonPutf("\",\"upiv\":%lu", (unsigned long)updateIntervalH);
+  jsonPut(",\"upstat\":\""); jsonPutEsc(updateStatus);   // upiv is a number: no quote to close
+  jsonPutf("\",\"blocking\":%s", blockingOn ? "true" : "false");
+  jsonPutf(",\"resumeIn\":%lu", (unsigned long)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0));
+  jsonPutf(",\"defcreds\":%s", (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false");
+  // Diagnostics: why the device booted, how much of the filesystem is in use,
+  // and what the last blocklist operation actually did.
+  jsonPut(",\"reset\":\""); jsonPutEsc(bootReset);
+  jsonPut("\",\"crash\":\""); jsonPutEsc(bootCrash);
+  jsonPutf("\",\"fsTotal\":%lu,\"fsUsed\":%lu",
+           (unsigned long)fsTotal, (unsigned long)fsUsed);
+  jsonPutf(",\"listBytes\":%lu", (unsigned long)listBytes);
+  jsonPut(",\"lastOp\":\""); jsonPutEsc(lastOp);
+  jsonPutf("\",\"lastOpOk\":%s", lastOpOk ? "true" : "false");
+  jsonPutf(",\"lastOpBytes\":%lu,\"lastOpAge\":%lu",
+           (unsigned long)lastOpBytes, (unsigned long)((millis() - lastOpAt) / 1000));
+  jsonPut(",\"clients\":[");
+  for (int i = 0; i < numClients; i++) {
+    Dev& c = clients[i];
+    char mac[18]; snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                            c.mac[0], c.mac[1], c.mac[2], c.mac[3], c.mac[4], c.mac[5]);
+    if (i) jsonPut(",");
+    jsonPut("{\"ip\":\""); jsonPutIp(c.ip);
+    jsonPut("\",\"mac\":\""); jsonPut(mac);
+    jsonPutf("\",\"blocked\":%lu,\"allowed\":%lu,\"banned\":%s}",
+             (unsigned long)c.blocked, (unsigned long)c.allowed, c.banned ? "true" : "false");
+  }
+  jsonPut("],\"custom\":[");
+  for (int i = 0; i < numCustom; i++) { if (i) jsonPut(","); jsonPut("\""); jsonPutEsc(customDom[i].c_str()); jsonPut("\""); }
+  jsonPut("]}");
+  jsonFlush();
+  web.sendContent("", 0);   // end of the chunked response
 }
 // Upstream shipped every state-changing/OTA endpoint with zero authentication —
 // anyone on the LAN could reflash firmware or rewrite the blocklist. Gate them.
@@ -455,6 +600,14 @@ static void handleBan() {
 // time (and survives a bad/truncated download). Only when space is short is the live
 // list freed first; then a rejected download leaves the device fail-open (forwarding,
 // no blocking) until the next good update.
+static void recoverBlocklist() {
+  // A crash between the two renames in commitNewBlocklist() parks the live list
+  // in /blocklist.old; put it back instead of booting with no list at all.
+  if (!LittleFS.exists(BLOCKLIST_PATH) && LittleFS.exists("/blocklist.old")) {
+    LittleFS.rename("/blocklist.old", BLOCKLIST_PATH);
+    Serial.println("[fs] recovered the previous blocklist after an interrupted swap");
+  }
+}
 static void reopenBlocklist() {
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
@@ -470,6 +623,7 @@ static size_t fsFree() {
 static bool swapKeptLive = false;                    // live list still open during this swap?
 static void beginBlocklistSwap(size_t expected) {    // expected = incoming size, 0 if unknown
   LittleFS.remove("/blocklist.new");
+  otaYield();                          // each remove can trigger a block erase
   if (!expected && blocklist) expected = blocklist.size();   // unknown: assume similar size
   swapKeptLive = expected && fsFree() > expected + 16384;     // 16 KB littlefs slack
   if (!swapKeptLive) {                               // no room for both: free the old list
@@ -504,8 +658,10 @@ static bool commitNewBlocklist(size_t expectSize, String& why) {   // /blocklist
   bool ok = validBlocklistFile("/blocklist.new", expectSize, why);
   if (ok) {
     if (blocklist) blocklist.close();
-    LittleFS.remove(BLOCKLIST_PATH);
+    if (LittleFS.exists(BLOCKLIST_PATH)) LittleFS.rename(BLOCKLIST_PATH, "/blocklist.old");
     LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
+    LittleFS.remove("/blocklist.old");
+    otaYield();
   } else {
     LittleFS.remove("/blocklist.new");
     Serial.printf("[swap] rejected: %s%s\n", why.c_str(), swapKeptLive ? " (kept current list)" : "");
@@ -531,26 +687,36 @@ static void handleUpload() {
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
 #if defined(ESP8266)
-      upOk = false; beginBlocklistSwap(0);            // size unknown here: estimated from the live list
+      upOk = false; upWritten = 0; beginBlocklistSwap(0);   // size unknown here: estimated from the live list
 #else
-      upOk = false; beginBlocklistSwap(web.clientContentLength());
+      upOk = false; upWritten = 0; beginBlocklistSwap(web.clientContentLength());
 #endif
+      otaInProgress = true; otaPowerDown();
       upFile = LittleFS.open("/blocklist.new", "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
-      if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
+      // Chunk the write and feed both watchdogs between chunks: a LittleFS block
+      // erase can stall the CPU for hundreds of ms and reboot mid-upload.
+      if (upAuthOk && upFile) {
+        const uint8_t* p = u.buf; size_t left = u.currentSize;
+        while (left) { size_t n = left > 512 ? 512 : left; upWritten += upFile.write(p, n); p += n; left -= n; otaYield(); }
+      }
       break;
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
+      otaInProgress = false; otaPowerRestore();
       if (upFile) upFile.close();
       upOk = commitNewBlocklist(0, upWhy);
-      Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
+      setLastOp("upload", upOk, upWritten);
+      Serial.printf("[ota] %s -> %u domains (%u bytes)\n", upOk ? "OK" : "REJECTED", numHashes, upWritten);
       break;
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
+      otaInProgress = false; otaPowerRestore();
       if (upFile) upFile.close();
       LittleFS.remove("/blocklist.new"); if (!swapKeptLive) reopenBlocklist();
+      setLastOp("upload", false, upWritten);
       Serial.println("[ota] aborted");
       break;
   }
@@ -566,9 +732,11 @@ static void loadUpdateCfg() {
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
   f.println(updateUrl); f.println(updateIntervalH); f.close();
+  otaYield();
 }
 static bool fetchBlocklist(String url) {
-  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
+  url.trim(); if (!url.length()) { updateStatus = "no url set"; setLastOp("fetch", false, 0); return false; }
+  if (otaInProgress) { updateStatus = "busy: upload in progress"; return false; }   // never two flash writers at once
   Serial.printf("[remote] GET %s\n", url.c_str());
   WiFiClientSecure cs;
 #if defined(ESP8266)
@@ -586,22 +754,25 @@ static bool fetchBlocklist(String url) {
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
   bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
+  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; setLastOp("fetch", false, 0); return false; }
   int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
+  if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); setLastOp("fetch", false, 0); return false; }
   int len = http.getSize();
   beginBlocklistSwap(len > 0 ? (size_t)len : 0);
+  otaPowerDown();
   File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; if (!swapKeptLive) reopenBlocklist(); return false; }
-  WiFiClient* stream = http.getStreamPtr(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  if (!f) { http.end(); otaPowerRestore(); updateStatus = "fs open failed"; setLastOp("fetch", false, 0); if (!swapKeptLive) reopenBlocklist(); return false; }
+  WiFiClient* stream = http.getStreamPtr(); uint8_t b[1024]; size_t total = 0, written = 0; uint32_t idle = millis();
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
+    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { written += f.write(b, n); total += n; idle = millis(); otaYield(); } }
     else { if (millis() - idle > 15000) break; delay(2); }
   }
   f.close(); http.end();
+  otaPowerRestore();
   String why;
   bool ok = commitNewBlocklist(len > 0 ? (size_t)len : 0, why);
+  setLastOp("fetch", ok, (uint32_t)written);
   updateStatus = ok ? ("ok: " + String(numHashes) + " domains")
                     : ("rejected: " + why + (swapKeptLive ? " (kept current list)" : ""));
   Serial.printf("[remote] %s\n", updateStatus.c_str());
@@ -621,6 +792,7 @@ static void handleFwUpload() {
   if (u.status == UPLOAD_FILE_START) {
     fwAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
     if (!fwAuthOk) { Serial.println("[fw-ota] auth/CSRF check failed, rejecting flash"); return; }
+    otaInProgress = true; otaPowerDown();
     Serial.printf("[fw-ota] %s\n", u.filename.c_str());
 #if defined(ESP8266)
     // The ESP8266 Updater stages the image at (end of sketch space - size) and needs a
@@ -634,13 +806,23 @@ static void handleFwUpload() {
 #endif
   } else if (u.status == UPLOAD_FILE_WRITE) {
     if (!fwAuthOk) return;
-    if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+    // Chunk the write and feed both watchdogs between chunks: a single
+    // Update.write can carry a whole TCP window, and the flash erase inside it
+    // can stall longer than the software-WDT window -> reboot mid-OTA.
+    const uint8_t* p = u.buf; size_t left = u.currentSize;
+    while (left) {
+      size_t n = left > 1024 ? 1024 : left;
+      if (Update.write(const_cast<uint8_t*>(p), n) != n) { Update.printError(Serial); break; }
+      p += n; left -= n; otaYield();
+    }
   } else if (u.status == UPLOAD_FILE_END) {
     if (!fwAuthOk) return;
+    otaInProgress = false; otaPowerRestore();
     if (Update.end(true)) Serial.printf("[fw-ota] %u bytes OK\n", u.totalSize);
     else Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_ABORTED) {
     if (!fwAuthOk) return;
+    otaInProgress = false; otaPowerRestore();
 #if defined(ESP8266)
     Update.end(false);   // the ESP8266 Updater has no abort(): end(false) resets the
                          // updater state without staging the image
@@ -770,10 +952,23 @@ void setup() {
 #else
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
 #endif
+#if defined(ESP8266)
+  // Why the device booted last time — captured first, before anything else can
+  // change it. The register dump is kept only for watchdog/exception resets:
+  // that is the case we need to explain after the fact.
+  { String r = ESP.getResetReason(); strncpy(bootReset, r.c_str(), sizeof(bootReset) - 1);
+    if (r.indexOf("Watchdog") >= 0 || r.indexOf("Exception") >= 0) {
+      String i = ESP.getResetInfo(); i.replace("\n", " | ");
+      strncpy(bootCrash, i.c_str(), sizeof(bootCrash) - 1); } }
+#else
+  { const char* r = resetReasonName(esp_reset_reason());
+    strncpy(bootReset, r, sizeof(bootReset) - 1); }
+#endif
+  recoverBlocklist();          // undo a swap that was interrupted by a crash
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
     numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
+    Serial.printf("blocklist: %u domains (reset: %s)\n", numHashes, bootReset);
     buildFlashIndex();
   }
   loadCustom(); loadBanned(); loadUpdateCfg(); upstreamLoad();
@@ -851,6 +1046,12 @@ void setup() {
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
   ArduinoOTA.setPassword(OTA_PASS);      // network OTA was unauthenticated upstream
+  // Feed both watchdogs on every progress tick and flag the window: the Updater's
+  // flash erases have the same stall risk as the web upload path.
+  ArduinoOTA.onStart([]() { otaInProgress = true; otaPowerDown(); });
+  ArduinoOTA.onEnd  ([]() { otaInProgress = false; otaPowerRestore(); });
+  ArduinoOTA.onError([](ota_error_t) { otaInProgress = false; otaPowerRestore(); });
+  ArduinoOTA.onProgress([](unsigned int, unsigned int) { otaYield(); });
   ArduinoOTA.begin();
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }
@@ -860,7 +1061,7 @@ void loop() {
   web.handleClient();
   bool busy = handleDns();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
-  if (updateUrl.length()) {               // periodic remote blocklist auto-update
+  if (updateUrl.length() && !otaInProgress) {   // periodic remote blocklist auto-update
     uint32_t now = millis();
     if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
     else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
