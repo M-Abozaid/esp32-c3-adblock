@@ -668,7 +668,18 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false);
+#ifdef STATIC_IP
+  // Optional fixed address (set with -DSTATIC_IP=a,b,c,d etc. in platformio.ini), so the
+  // box keeps the same IP for the router's DNS setting even without a DHCP reservation.
+  // Pick an address outside the router's DHCP pool. STATIC_DNS is what WiFi.dnsIP() returns,
+  // so the "router" upstream mode forwards there when a fixed IP is in use.
+  if (!WiFi.config(IPAddress(STATIC_IP), IPAddress(STATIC_GW), IPAddress(STATIC_MASK), IPAddress(STATIC_DNS)))
+    Serial.println("WiFi: static IP config failed; falling back to DHCP");
+  else
+    Serial.printf("WiFi: using static IP %s\n", IPAddress(STATIC_IP).toString().c_str());
+#endif
+  WiFi.begin(ssid, pass);
 #if defined(WIFI_TX_POWER) && !defined(ESP8266)
   WiFi.setTxPower((wifi_power_t)WIFI_TX_POWER);    // e.g. -DWIFI_TX_POWER=WIFI_POWER_8_5dBm
 #endif
