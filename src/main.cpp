@@ -103,6 +103,103 @@ String      portalOpts;             // <option> list of scanned networks, built 
 bool     blockingOn = true;
 uint32_t resumeAt   = 0;            // millis() to auto-resume; 0 = paused indefinitely / not paused
 
+// ---------- dashboard history (AdGuard-style cards) ----------
+// 96 buckets x 15 min = 24 h of history for the dashboard sparklines. Every query is
+// either blocked or allowed, so allowed in a bucket is simply histQ - histB.
+// Cost: 2 x HIST_BUCKETS x 2 bytes = 384 bytes of .bss, fixed and never allocated.
+#ifndef HIST_BUCKETS
+#define HIST_BUCKETS 96
+#endif
+#define HIST_BUCKET_MS (15UL * 60UL * 1000UL)
+static uint16_t histQ[HIST_BUCKETS];   // queries per bucket
+static uint16_t histB[HIST_BUCKETS];   // blocked per bucket
+static uint32_t histStart = 0;         // millis() at the start of histPos
+static uint16_t histPos   = 0;         // index of the bucket currently filling
+
+// Bounded "top N" domain tables. Misra-Gries style: when the table is full the
+// counts are decremented and empty slots reclaimed, so reported counts are upper
+// bounds — accurate enough for a dashboard and O(TOP_DOMAINS) with no allocation.
+#ifndef TOP_DOMAINS
+#define TOP_DOMAINS 16
+#endif
+#define TOP_NAME_LEN 48
+struct TopDom { uint32_t count; char name[TOP_NAME_LEN]; };
+static TopDom topQ[TOP_DOMAINS];       // most queried
+static TopDom topB[TOP_DOMAINS];       // most blocked
+static uint64_t qTimeUs = 0;           // accumulated per-query handling time
+static uint32_t qTimed  = 0;           // queries measured
+
+static void histAdvance() {
+  const uint32_t now = millis();
+  if (histStart == 0) { histStart = now; return; }
+  uint32_t steps = (now - histStart) / HIST_BUCKET_MS;
+  if (!steps) return;
+  if (steps >= HIST_BUCKETS) {                       // fully aged out
+    memset(histQ, 0, sizeof(histQ)); memset(histB, 0, sizeof(histB));
+    histStart = now; histPos = 0; return;
+  }
+  for (uint32_t n = steps; n > 0; n--) {
+    histPos = (uint16_t)((histPos + 1) % HIST_BUCKETS);
+    histQ[histPos] = 0; histB[histPos] = 0;
+  }
+  histStart += steps * HIST_BUCKET_MS;
+}
+
+static void topBump(TopDom* arr, const char* name) {
+  if (!name || !*name) return;
+  for (int i = 0; i < TOP_DOMAINS; i++)
+    if (arr[i].count && strcmp(arr[i].name, name) == 0) { arr[i].count++; return; }
+  for (int i = 0; i < TOP_DOMAINS; i++)
+    if (!arr[i].count) {
+      arr[i].count = 1;
+      strncpy(arr[i].name, name, TOP_NAME_LEN - 1); arr[i].name[TOP_NAME_LEN - 1] = 0;
+      return;
+    }
+  for (int i = 0; i < TOP_DOMAINS; i++) if (arr[i].count) arr[i].count--;
+  for (int i = 0; i < TOP_DOMAINS; i++)
+    if (!arr[i].count) {
+      arr[i].count = 1;
+      strncpy(arr[i].name, name, TOP_NAME_LEN - 1); arr[i].name[TOP_NAME_LEN - 1] = 0;
+      return;
+    }
+}
+
+// ---------- query log (opt-in, RAM only) ----------
+// Fixed ring in .bss, off by default. A query log is a record of every domain
+// every device on the LAN visits, and this dashboard is served over plain HTTP
+// with Basic Auth, so it is not something to collect unasked. Deliberately
+// RAM-only: nothing is written to flash, so a reboot forgets it entirely.
+#ifndef QLOG_SIZE
+#define QLOG_SIZE 256
+#endif
+#define QLOG_NAME_LEN 64
+struct QLogEntry { uint32_t ts; uint32_t ip; uint8_t flags; char domain[QLOG_NAME_LEN]; };
+static QLogEntry qlog[QLOG_SIZE];
+static uint16_t qlogHead  = 0;      // next slot to write
+static uint16_t qlogCount = 0;      // entries held (saturates at QLOG_SIZE)
+static bool     qlogOn    = false;  // opt-in
+
+static uint32_t qlogClock() {
+#if defined(ESP8266)
+  return 0;                         // no SNTP hook on the ESP8266 build
+#else
+  const time_t now = time(nullptr);
+  return (now > 1600000000) ? (uint32_t)now : 0;   // 0 until SNTP has synced
+#endif
+}
+
+static void qlogAdd(uint32_t ip, const char* domain, bool blocked, bool banned) {
+  if (!qlogOn || !domain || !*domain) return;
+  QLogEntry& e = qlog[qlogHead];
+  e.ts = qlogClock();
+  e.ip = ip;
+  e.flags = (uint8_t)((blocked ? 1 : 0) | (banned ? 2 : 0));
+  strncpy(e.domain, domain, QLOG_NAME_LEN - 1);
+  e.domain[QLOG_NAME_LEN - 1] = 0;
+  qlogHead = (uint16_t)((qlogHead + 1) % QLOG_SIZE);
+  if (qlogCount < QLOG_SIZE) qlogCount++;
+}
+
 // ---------- platform shims ----------
 #if defined(ESP8266)
 // The ESP8266EX has no internal temperature sensor. Same name/signature as the ESP32
@@ -359,9 +456,11 @@ static int forwardUpstream(int qlen, int qend) {
 // one packet per loop iteration. Returns true if any query was handled this call.
 static bool handleDns() {
   bool did = false;
+  histAdvance();
   for (int budget = 0; budget < 16; budget++) {
     int sz = dnsServer.parsePacket(); if (sz <= 0) break;
     did = true;
+    const uint32_t t0 = micros();
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
     int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
@@ -373,6 +472,13 @@ static bool handleDns() {
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
     if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+    // Dashboard history + heavy-hitter tables. Saturating counters: a single
+    // 15-minute bucket cannot realistically reach 65535 queries, but a stuck
+    // client must not be able to wrap one to zero.
+    if (histQ[histPos] < 0xFFFF) histQ[histPos]++;
+    if (blocked && histB[histPos] < 0xFFFF) histB[histPos]++;
+    if (dl) { topBump(topQ, domain); if (blocked) topBump(topB, domain); qlogAdd((uint32_t)cip, domain, blocked, ban); }
+    qTimeUs += (uint32_t)(micros() - t0); qTimed++;
   }
   return did;
 }
@@ -403,6 +509,20 @@ static String htmlEscape(const String& s) {
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 
+// Emit a top-N table as [{"d":"domain","n":count}, ...] in descending count order.
+// Selection sort over at most TOP_DOMAINS entries — no allocation, no recursion.
+static void emitTop(String& j, TopDom* arr) {
+  int idx[TOP_DOMAINS]; int n = 0;
+  for (int i = 0; i < TOP_DOMAINS; i++) if (arr[i].count) idx[n++] = i;
+  for (int a = 0; a < n; a++)
+    for (int b = a + 1; b < n; b++)
+      if (arr[idx[b]].count > arr[idx[a]].count) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+  for (int i = 0; i < n; i++) {
+    j += (i ? "," : "");
+    j += "{\"d\":\"" + jesc(String(arr[idx[i]].name)) + "\",\"n\":" + (unsigned)arr[idx[i]].count + "}";
+  }
+}
+
 static void handleStats() {
   uint32_t up = millis() / 1000;
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
@@ -419,6 +539,47 @@ static void handleStats() {
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
+  // 24 h history, oldest bucket first so the dashboard can plot left-to-right.
+  j += "],\"logOn\":";
+  j += (qlogOn ? "true" : "false");
+  j += ",\"logCount\":";
+  j += (unsigned)qlogCount;
+  j += ",\"seriesQ\":[";
+  for (int i = 0; i < HIST_BUCKETS; i++) { if (i) j += ","; j += (unsigned)histQ[(histPos + 1 + i) % HIST_BUCKETS]; }
+  j += "],\"seriesB\":[";
+  for (int i = 0; i < HIST_BUCKETS; i++) { if (i) j += ","; j += (unsigned)histB[(histPos + 1 + i) % HIST_BUCKETS]; }
+  j += "],\"avgMs\":" + (qTimed ? String((double)qTimeUs / (double)qTimed / 1000.0, 2) : String("0"));
+  j += ",\"topQueried\":[";
+  emitTop(j, topQ);
+  j += "],\"topBlocked\":[";
+  emitTop(j, topB);
+  j += "]}";
+  web.send(200, "application/json", j);
+}
+
+// The query log is read-only but far more sensitive than /stats.json — it is a
+// browsing history for the whole LAN — so unlike the other read endpoints it
+// requires credentials as well. It only exists if someone already authenticated
+// to switch logging on.
+static void handleLog() {
+  if (!web.authenticate(WEB_USER, WEB_PASS)) { web.requestAuthentication(); return; }
+  const int MAXR = 100;                            // cap the response; the ring holds more
+  const int n = ((int)qlogCount < MAXR) ? (int)qlogCount : MAXR;
+  String j; j.reserve(180 + n * 96);
+  j += "{\"on\":"; j += (qlogOn ? "true" : "false");
+  j += ",\"total\":" + String((unsigned)qlogCount);
+  j += ",\"clock\":" + String((unsigned)qlogClock());
+  j += ",\"entries\":[";
+  for (int i = 0; i < n; i++) {
+    int idx = (int)qlogHead - 1 - i;               // newest first
+    while (idx < 0) idx += QLOG_SIZE;
+    const QLogEntry& e = qlog[idx];
+    IPAddress ip(e.ip);
+    j += (i ? "," : "");
+    j += "{\"t\":" + String((unsigned)e.ts) + ",\"ip\":\"" + ip.toString() +
+         "\",\"d\":\"" + jesc(String(e.domain)) + "\",\"b\":" + ((e.flags & 1) ? "true" : "false") +
+         ",\"x\":" + ((e.flags & 2) ? "true" : "false") + "}";
+  }
   j += "]}";
   web.send(200, "application/json", j);
 }
@@ -442,6 +603,17 @@ static bool requireAuth() {
   if (web.authenticate(WEB_USER, WEB_PASS)) return true;
   web.requestAuthentication();
   return false;
+}
+
+// Toggling the log is a state change, so it goes through the full CSRF+auth gate.
+// Disabling also discards whatever was captured, so "off" really means nothing
+// is being held in memory.
+static void handleSetLog() {
+  if (!requireAuth()) return;
+  const bool on = web.hasArg("on") && web.arg("on") == "1";
+  if (!on) { qlogCount = 0; qlogHead = 0; }
+  qlogOn = on;
+  web.send(200, "text/plain", on ? "logging on" : "logging off");
 }
 static void handleBan() {
   if (!requireAuth()) return;
@@ -686,6 +858,11 @@ static bool connectWiFi() {
     Serial.println();
   }
 #endif
+#if !defined(ESP8266)
+  // Wall clock for query-log timestamps. UTC; the browser renders local time.
+  // Without this the log can only show "N seconds ago".
+  if (WiFi.status() == WL_CONNECTED) configTime(0, 0, "pool.ntp.org", "time.google.com");
+#endif
   return WiFi.status() == WL_CONNECTED;
 }
 
@@ -812,6 +989,8 @@ void setup() {
 #endif  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
+  web.on("/log.json", handleLog);
+  web.on("/setlog", handleSetLog);
   web.on("/ban", handleBan);
   web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
