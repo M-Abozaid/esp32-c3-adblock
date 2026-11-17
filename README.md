@@ -9,7 +9,9 @@ Also builds for the **ESP8266** (NodeMCU / D1 mini, 4 MB flash) — see [ESP8266
 
 The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
 domains as **sorted 40-bit hashes in flash** and binary-search them. 140,000+ domains
-fit in ~0.7 MB of flash and are matched in ~10 ms, using **~50 KB of RAM**.
+fit in ~0.7 MB of flash and are matched in ~10 ms, using **~76 KB of RAM**
+(measured static usage: the 20 KB first-level hash index + lookup cache on top of
+the stack — still no PSRAM, and the hash table itself stays in flash).
 
 ```
 query in ──▶ extract domain ──▶ FNV-1a hash (+ parent suffixes)
@@ -27,7 +29,7 @@ demand PSRAM. This project stores fixed **5-byte (40-bit) hashes in flash** inst
 |---|---|---|
 | Hardware | ESP32 + PSRAM (~$8) | ESP32-C3, no PSRAM (~$2) |
 | 141k domains | ~2.5 MB of RAM | **0.67 MB of flash** |
-| RAM used | most of it | **~50 KB** |
+| RAM used | most of it | **~76 KB** (incl. 20 KB index + cache) |
 | Lookup | string compare | ~18 flash reads (~10 ms incl. WiFi RTT) |
 | Collisions | n/a | 0 at 141k (1 at 537k) |
 
@@ -205,7 +207,7 @@ The dashboard's read-only view (`/`, `/stats.json`) stays open, but every
 state-changing endpoint requires **HTTP Basic Auth** (`WEB_USER`/`WEB_PASS` from
 `secrets.h`):
 
-- `/ban`, `/addblock`, `/unblock`, `/forgetwifi`
+- `/ban`, `/addblock`, `/unblock`, `/pause`, `/resume`, `/forgetwifi`
 - `/upload`, `/update` (blocklist and firmware OTA)
 - `/setupdate`, `/fetchnow`
 
@@ -237,6 +239,15 @@ now also requires a custom `X-Requested-With: c3-adblock` header, which a plain
 `<img>`/auto-submitted `<form>` CSRF can't attach (only same-origin `fetch()`
 can, which is what the dashboard's own JS does) — this is why `/forgetwifi` is
 no longer a bare URL you can visit directly; use the dashboard button instead.
+
+**Remote blocklist fetch is TLS-encrypted but not certificate-validated**
+(`setInsecure()`): a passive observer can't tamper with the download, but an
+active on-path attacker (rogue AP, ARP-spoofed gateway) could serve a
+substitute blocklist and thereby steer which domains get blocked or allowed on
+your network. Firmware reflashing is *not* reachable through this path.
+Certificate pinning would close it, but breaks whenever the hosting rotates
+certs — an accepted tradeoff for a filter list. Plain-`http://` update URLs are
+of course fully interceptable and best avoided.
 
 **Default credentials:** if `secrets.h` still has the placeholder
 `CHANGE_ME_WEB_PASSWORD` / `CHANGE_ME_OTA_PASSWORD` values from
