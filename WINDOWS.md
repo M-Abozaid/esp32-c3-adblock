@@ -188,6 +188,48 @@ LittleFS partition at `0x2b0000` — see [partitions.csv](partitions.csv).
 
 ---
 
+## The upload hangs with no output
+
+**Symptom:** `pio run -t upload` prints `Uploading .pio/build/<env>/firmware.bin`, then sits
+there for minutes — sometimes long enough that you give up. No error is printed.
+
+**Cause:** PlatformIO draws the upload progress bar with Unicode block characters (`░`/`█`).
+If the console codepage is not UTF-8 (the default is `cp1252` on most Windows installs),
+Python cannot encode them, and the exception kills the thread reading the uploader's output.
+The transfer stalls behind it:
+
+```
+Exception in thread Thread-16 (run):
+  ...
+  File "encodings\cp1252.py", line 19, in encode
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 23-52
+```
+
+The build output itself hints at this: *"Firmware metrics can not be shown. Set the terminal
+codepage to 'utf-8' or 'cp65001' on Windows."*
+
+**Fix:** set the Python stream encoding and the console codepage before flashing:
+
+```powershell
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
+chcp 65001
+pio run -t upload --upload-port COMx
+```
+
+The same upload then completes in well under a minute.
+
+Two related notes:
+
+- **Don't buffer the output** if you need to watch progress. `pio ... | Select-Object -Last 20`
+  prints nothing until the command exits, so a stalled upload looks exactly like a slow one.
+  Redirect to a file or run it unpiped when you need to see it live.
+- A stall like this usually happens once the progress bar starts drawing, which is *after* the
+  target region has been erased — so the board is left blank or partially written. Just re-run
+  the upload; there is nothing to recover by hand.
+
+---
+
 ## `nvs_open failed: NOT_FOUND` in the boot log
 
 ```
@@ -253,7 +295,10 @@ python -m esptool --chip esp32c3 --port COMx chip-id           # is it talking?
 python -m esptool --chip esp32c3 --port COMx erase-flash       # blank it
 
 pio run -e c3
-pio run -t upload        # firmware -> app0
+pio run -t upload        # firmware -> app0   (see the UTF-8 note below if this hangs)
 pio run -t uploadfs      # blocklist -> spiffs
 pio device monitor
 ```
+
+If `pio run -t upload` hangs with no output, the progress bar is crashing on a non-UTF-8
+console — see [The upload hangs with no output](#the-upload-hangs-with-no-output).
