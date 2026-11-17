@@ -275,6 +275,11 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 
 ## Gotchas (learned the hard way)
 
+- **Windows:** no driver is needed — the C3's built-in USB-Serial/JTAG uses the
+  in-box `usbser`, so ignore any advice to install a CH340 driver. See
+  [WINDOWS.md](WINDOWS.md) for driver-free setup, the connect/disconnect-loop
+  diagnostic, and why `pio device monitor` can look silent while the firmware is
+  running fine.
 - **ModemManager** (default on Fedora/Ubuntu) grabs `/dev/ttyACM0` and toggles
   DTR/RTS, which **resets the C3** and blocks serial. Fix:
   ```bash
