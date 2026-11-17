@@ -313,7 +313,9 @@ static void loadCustom() {
 static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
 static bool addCustom(String d) {
   d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
+  // 253 = RFC 1035 max domain length: a URL arg can carry multi-KB strings that would
+  // bloat custom.txt and every subsequent /stats.json render (escaped, but huge).
+  if (!d.length() || d.indexOf('.') < 0 || d.length() > 253 || numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
   customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
 }
