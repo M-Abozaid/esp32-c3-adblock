@@ -521,7 +521,11 @@ static String upWhy;
 static bool upAuthOk = false;
 static File upFile;
 static void handleUploadDone() {
-  if (!upAuthOk) { web.requestAuthentication(); return; }
+  // Independent re-check, not the upAuthOk flag: that flag is only set by the upload
+  // callback, which never fires for a POST without a multipart file part — a stale
+  // true left over from an earlier request would answer "ok" unauthenticated.
+  if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return; }
+  if (!web.authenticate(WEB_USER, WEB_PASS)) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain", upOk ? String("ok") : "rejected: " + upWhy);
 }
 static void handleUpload() {
@@ -611,7 +615,10 @@ static bool fetchBlocklist(String url) {
 // ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
 static bool fwAuthOk = false;
 static void handleFwUpdateDone() {
-  if (!fwAuthOk) { web.requestAuthentication(); return; }
+  // Independent re-check (same rationale as handleUploadDone): a stale fwAuthOk must
+  // never be able to reach the ESP.restart() path on a bodyless POST.
+  if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return; }
+  if (!web.authenticate(WEB_USER, WEB_PASS)) { web.requestAuthentication(); return; }
   bool ok = !Update.hasError();
   web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
   if (ok) { delay(300); ESP.restart(); }
