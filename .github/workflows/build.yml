@@ -40,3 +40,31 @@ jobs:
           test "$(stat -c%s t.bin)" -eq 15   # 3 entries x 5 bytes
       - name: Unit tests
         run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+
+  # Prebuilt binaries are not byte-reproducible (the image embeds a build timestamp),
+  # so the committed docs/ assets are NOT auto-committed from CI. Instead every push
+  # produces a fresh, guaranteed-current set as a downloadable artifact, and the
+  # committed assets are regenerated manually via tools/build_web_installer.sh when
+  # the firmware or partition table changes. This closes the window where docs/
+  # served a months-old firmware that predated the auth/CSRF hardening.
+  web-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - run: pip install -U platformio
+      - name: Placeholder secrets (real ones are gitignored; the firmware falls back to the setup portal)
+        run: cp src/secrets.example.h src/secrets.h
+      - name: Rebuild browser-installer assets (docs/)
+        run: tools/build_web_installer.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-installer-docs
+          path: docs/
+          retention-days: 90
