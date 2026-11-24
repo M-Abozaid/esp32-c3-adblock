@@ -9,7 +9,7 @@ header{background:#161b22;padding:14px 18px;border-bottom:1px solid #30363d}
 h1{margin:0;font-size:18px}h1 span{color:#3fb950}.wrap{padding:16px;max-width:1000px;margin:auto}
 .cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;flex:1;min-width:120px}
-.card .v{font-size:22px;font-weight:600}.card .l{color:#8b949e;font-size:12px}
+.card .v{font-size:22px;font-weight:600;overflow-wrap:anywhere}.card .l{color:#8b949e;font-size:12px}
 table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:18px}
 th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:13px}
 th{background:#21262d;color:#8b949e}tr:hover td{background:#1c2128}
@@ -64,12 +64,12 @@ blockdot.textContent=on?'🛡️':'⏸️';blockbar.style.borderColor=on?'#30363
 blockstate.textContent=on?'Blocking active':(s.resumeIn>0?'Paused — resumes in '+s.resumeIn+'s':'Paused');
 pausebtn.textContent=on?'Pause':'Resume';pausedur.style.display=on?'':'none';
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
+['IPv6 DNS',s.dns6Ready?'Listening':'Disabled',''],['IPv6 address',esc(s.ipv6||s.ipv6LinkLocal||'Not assigned'),''],['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+`<tr><td>${esc(c.ip)}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+<td><button class=ban data-ip="${esc(c.ip)}">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
 cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
