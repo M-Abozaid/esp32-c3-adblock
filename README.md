@@ -262,9 +262,30 @@ resolver if this box is the *backup* for a Pi-hole/AdGuard your router hands out
 forwarding to it would fail exactly when the backup is needed. (From China, AliDNS
 `223.5.5.5` is much faster than Quad9; see #47.)
 
-**IPv6:** this resolver answers over IPv4. If your router also advertises an IPv6 DNS
-server (RDNSS/DHCPv6), devices may use that and bypass the blocker, so turn it off or point
-it elsewhere on the router.
+**IPv6 (ESP32):** DNS queries are accepted over both IPv4 and IPv6 UDP port 53.
+Wi-Fi station IPv6/SLAAC is enabled automatically; an IPv6-capable router is required.
+The dashboard shows the IPv6 listener status and a routable IPv6 address (preferring
+ULA over the provider prefix), or the link-local address until one is assigned.
+Clients and persisted client bans retain the complete IPv4 or IPv6 address. IPv6
+client MAC lookup is not implemented; those entries show an unknown/all-zero MAC.
+The ESP8266 remains IPv4-only. Allowed queries from either family are still forwarded
+to the configured **IPv4** upstream; A/AAAA record types are independent of transport.
+Blocked AAAA queries keep the existing empty NOERROR response.
+
+Configure the router's DNSv6/RDNSS/DHCPv6 settings to use the device's stable local IPv6
+address as well as its IPv4 address. Advertising a different public DNS server allows
+clients to bypass blocking. A provider/public fallback prioritizes availability over
+strict filtering. IPv6 internet connectivity does not need to be disabled.
+
+Check both transports (use your own addresses):
+
+```bash
+python3 tools/test_dual_stack.py --ipv4 192.0.2.2 --ipv6 fd00::2
+# Link-local addresses require an interface scope, e.g. fe80::1234%eth0.
+```
+
+The test checks allowed and blocked A/AAAA queries, EDNS, malformed-packet recovery,
+and a bounded alternating IPv4/IPv6 burst. It does not claim TCP DNS support.
 
 Test:
 

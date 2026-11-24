@@ -62,6 +62,43 @@ static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 
 // ---- globals ----
 WiFiUDP dnsServer, upstreamCli;
+#if !defined(ESP8266) && CONFIG_LWIP_IPV6
+  #define DNS_IPV6 1
+  WiFiUDP dnsServer6;
+#else
+  #define DNS_IPV6 0
+#endif
+static bool dns6Ready = false;
+// IPv6 clients retain all 128 address bits; IPv4 remains backwards compatible.
+static bool isIPv6(const IPAddress& ip) {
+#if DNS_IPV6
+  return ip.type() == IPv6;
+#else
+  (void)ip; return false;
+#endif
+}
+static String dnsIPv6Address() {
+#if DNS_IPV6
+  // Prefer the router's ULA: unlike the provider prefix it survives reconnects.
+  for (netif* nif = netif_list; nif; nif = nif->next)
+    for (int i = 1; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
+      const ip6_addr_t* a = netif_ip6_addr(nif, i);
+      if (ip6_addr_ispreferred(netif_ip6_addr_state(nif, i)) && ip6_addr_isuniquelocal(a)) {
+        ip_addr_t addr; ip_addr_copy_from_ip6(addr, *a); return IPAddress(&addr).toString();
+      }
+    }
+  IPAddress global = WiFi.STA.globalIPv6();
+  if (global != IPAddress(IPv6)) return global.toString();
+#endif
+  return "";
+}
+static String dnsIPv6LinkLocal() {
+#if DNS_IPV6
+  IPAddress ip = WiFi.STA.linkLocalIPv6();
+  if (ip != IPAddress(IPv6)) return ip.toString();
+#endif
+  return "";
+}
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
@@ -80,13 +117,13 @@ static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 #ifndef MAX_CUSTOM
 #define MAX_CUSTOM 200
 #endif
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
+struct Dev { IPAddress ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
 String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0;
 
 static const int MAX_BAN = 32;
-uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
+IPAddress bannedIP[MAX_BAN]; int numBanned = 0;
 
 // remote blocklist auto-update
 String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
@@ -227,10 +264,10 @@ static void removeCustom(String d) {
     numCustom--; saveCustom(); return;
   }
 }
-static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
+static bool isBannedIP(const IPAddress& ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
 static void loadBanned() {
   numBanned = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
-  while (f.available() && numBanned < MAX_BAN) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip; }
+  while (f.available() && numBanned < MAX_BAN) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = ip; }
   f.close();
 }
 static void saveBanned() {
@@ -253,12 +290,12 @@ static void getMac(uint32_t ip, uint8_t* mac) {
   (void)ip;   // the ESP8266 exposes no ARP table; clients are identified by IP
 #endif
 }
-static Dev* getClient(uint32_t ip) {
+static Dev* getClient(const IPAddress& ip) {
   for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
     c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
-    getMac(ip, c->mac); return c;
+    if (isIPv6(ip)) memset(c->mac, 0, 6); else getMac((uint32_t)ip, c->mac); return c;
   }
   return nullptr;
 }
@@ -357,24 +394,32 @@ static int forwardUpstream(int qlen, int qend) {
 }
 // Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
 // one packet per loop iteration. Returns true if any query was handled this call.
-static bool handleDns() {
+static bool handleDnsSocket(WiFiUDP& socket) {
   bool did = false;
   for (int budget = 0; budget < 16; budget++) {
-    int sz = dnsServer.parsePacket(); if (sz <= 0) break;
+    int sz = socket.parsePacket(); if (sz <= 0) break;
     did = true;
-    IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    IPAddress cip = socket.remoteIP(); uint16_t cport = socket.remotePort();
+    int qlen = socket.read(buf, sizeof(buf)); if (qlen < 13) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
-    Dev* c = getClient((uint32_t)cip);
+    if (!dl) continue;
+    Dev* c = getClient(cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
     int rlen;
     if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
-    if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+    if (rlen > 0) { socket.beginPacket(cip, cport); socket.write(buf, rlen); socket.endPacket(); }
   }
   return did;
+}
+static bool handleDns() {
+  bool busy = handleDnsSocket(dnsServer);
+#if DNS_IPV6
+  if (dns6Ready) busy = handleDnsSocket(dnsServer6) || busy;
+#endif
+  return busy;
 }
 
 // ---------- web ----------
@@ -405,8 +450,10 @@ static String htmlEscape(const String& s) {
 
 static void handleStats() {
   uint32_t up = millis() / 1000;
+  String ip6 = dnsIPv6Address(), ip6ll = dnsIPv6LinkLocal();
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
+             ",\"ipv6\":\"" + ip6 + "\",\"ipv6LinkLocal\":\"" + ip6ll + "\",\"dns6Ready\":" + (dns6Ready ? "true" : "false") +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
              ",\"dns\":\"" + upstreamDns.toString() + "\",\"dnsSource\":\"" + upstreamSource + "\"" +
@@ -445,7 +492,7 @@ static bool requireAuth() {
 }
 static void handleBan() {
   if (!requireAuth()) return;
-  IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
+  IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient(ip); if (c) { c->banned = !c->banned; saveBanned(); } }
   web.send(200, "text/plain", "ok");
 }
 
@@ -668,7 +715,11 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false);
+#if DNS_IPV6
+  WiFi.STA.enableIPv6();
+#endif
+  WiFi.begin(ssid, pass);
 #if defined(WIFI_TX_POWER) && !defined(ESP8266)
   WiFi.setTxPower((wifi_power_t)WIFI_TX_POWER);    // e.g. -DWIFI_TX_POWER=WIFI_POWER_8_5dBm
 #endif
@@ -805,6 +856,10 @@ void setup() {
                     "device on a network you don't fully control.");
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+#if DNS_IPV6
+  dns6Ready = dnsServer6.begin(IPAddress(IPv6), DNS_PORT);
+  Serial.printf("DNS IPv6 :53 %s\n", dns6Ready ? "listening" : "FAILED");
+#endif
 #if defined(ESP8266)
   web.collectHeaders(CSRF_HEADER);       // ESP8266's collectHeaders is variadic
 #else
