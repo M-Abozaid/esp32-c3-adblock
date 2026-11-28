@@ -12,6 +12,10 @@
 # Generated blocklist (build it with tools/build_blocklist.py)
 data/blocklist.bin
 
+# Custom blocked domains (device state: lives in LittleFS as /custom.txt). Kept here so
+# `pio run -t uploadfs` carries them, but they are per-install, not source.
+data/custom.txt
+
 # WiFi credentials (copy src/secrets.example.h -> src/secrets.h)
 src/secrets.h
 
